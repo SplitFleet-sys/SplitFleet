@@ -1,0 +1,231 @@
+import sys
+import asyncio
+import traceback
+import concurrent.futures
+from functools import partial
+from logging import INFO, WARN, ERROR
+from typing import Optional, Tuple
+
+import grpc
+import grpc.aio
+
+from flwr.common import GRPC_MAX_MESSAGE_LENGTH, EventType, event
+from flwr.common import log
+from flwr.server.history import History
+from flwr.server import ServerConfig
+from flwr.server.server import run_fl
+from flwr.proto.transport_pb2_grpc import add_FlowerServiceServicer_to_server
+from flwr.server.client_manager import ClientManager, SimpleClientManager
+
+from splitfleet.server.grpc.flower_servicer import FlowerServiceServicer
+from splitfleet.server.server_model.manager import ServerModelManager, GrpcServerModelManager
+from splitfleet.server.stage_runtime.manager import StageRuntimeManager
+from splitfleet.server.strategy import Strategy
+from splitfleet.server.grpc.servicer import ServerModelServicer
+from splitfleet.server.server import Server
+from splitfleet.common.utils import run_async
+from splitfleet.common.address import parse_address
+from splitfleet.proto import server_model_pb2_grpc
+from splitfleet.server.telemetry import LiveServerTelemetry
+
+
+ADDRESS_FLEET_API_GRPC_BIDI = "[::]:8080"  # IPv6 to keep start_server compatible
+
+
+def init_defaults(
+    server: Optional[Server],
+    config: Optional[ServerConfig],
+    strategy: Strategy,
+    client_manager: Optional[ClientManager],
+) -> Tuple[Server, ServerConfig]:
+    """Create server instance if none was given."""
+
+    if server is None:
+        if client_manager is None:
+            client_manager = SimpleClientManager()
+
+        if getattr(strategy, "uses_stage_runtime", False):
+            # Keep the switch on by default.  TorchReplicaRNG uses a
+            # thread-local dispatch mode and never replaces the process-wide
+            # generator, so this is safe for one or many suffix lanes.
+            replica_rng_isolation = True
+            server_model_manager = StageRuntimeManager(
+                init_server_model_fn=strategy.init_server_model_fn,
+                autosplit_session=getattr(strategy, "autosplit_session", None),
+                replica_rng_isolation=replica_rng_isolation,
+            )
+            if hasattr(strategy, "bind_stage_runtime_manager"):
+                strategy.bind_stage_runtime_manager(server_model_manager)
+            if hasattr(strategy, "get_or_create_placement_plan"):
+                server_model_manager.set_placement_plan(
+                    strategy.get_or_create_placement_plan()
+                )
+        else:
+            server_model_manager = GrpcServerModelManager(
+                init_server_model_fn=strategy.init_server_model_fn,
+                persistent_models=bool(
+                    getattr(strategy, "persistent_server_models", False)
+                ),
+            )
+
+        server = Server(
+            client_manager=client_manager,
+            strategy=strategy,
+            server_model_manager=server_model_manager
+        )
+    elif strategy is not None:
+        log(WARN, "Both server and strategy were provided, ignoring strategy")
+
+    if config is None:
+        config = ServerConfig()
+
+    return server, config
+
+
+async def start_grpc_server(  # pylint: disable=too-many-arguments
+    client_manager: ClientManager,
+    server_model_manager: ServerModelManager,
+    server_address: str,
+    max_concurrent_workers: int = 1000,
+    max_message_length: int = GRPC_MAX_MESSAGE_LENGTH,
+    keepalive_time_ms: int = 30_000,
+    certificates: Optional[Tuple[bytes, bytes, bytes]] = None,
+    telemetry=None,
+    execution_concurrency=None,
+) -> grpc.Server:
+
+    options = [
+        ("grpc.max_concurrent_streams", max(100, max_concurrent_workers)),
+        ("grpc.max_send_message_length", max_message_length),
+        ("grpc.max_receive_message_length", max_message_length),
+        ("grpc.keepalive_time_ms", keepalive_time_ms),
+        ("grpc.keepalive_timeout_ms", 60_000),
+        ("grpc.http2.min_ping_interval_without_data_ms", 10_000),
+        ("grpc.http2.max_pings_without_data", 0),
+        ("grpc.keepalive_permit_without_calls", 1),
+    ]
+
+    server = grpc.aio.server(
+        migration_thread_pool=concurrent.futures.ThreadPoolExecutor(max_concurrent_workers),
+        maximum_concurrent_rpcs=max_concurrent_workers,
+        options=options,
+    )
+
+    if certificates is not None:
+        if len(certificates) != 3 or not all(
+            isinstance(value, bytes) and value for value in certificates
+        ):
+            sys.exit(1)
+
+        root_certificate_b, certificate_b, private_key_b = certificates
+
+        server_credentials = grpc.ssl_server_credentials(
+            ((private_key_b, certificate_b),),
+            root_certificates=root_certificate_b,
+            require_client_auth=False,
+        )
+        server.add_secure_port(server_address, server_credentials)
+    else:
+        server.add_insecure_port(server_address)
+
+    slbd_servicer = ServerModelServicer(server_model_manager,
+        execution_concurrency=execution_concurrency, telemetry=telemetry)
+    # Keep the same servicer available for drain/shutdown and telemetry cleanup.
+    server.splitfleet_servicer = slbd_servicer
+    server_model_pb2_grpc.add_ServerModelServicer_to_server(slbd_servicer, server)
+
+    flwr_servicer = FlowerServiceServicer(client_manager)
+    add_FlowerServiceServicer_to_server(flwr_servicer, server)
+
+    try:
+        if telemetry is not None:
+            await asyncio.to_thread(telemetry.start)
+        await server.start()
+    except BaseException:
+        slbd_servicer.shutdown_executor()
+        raise
+
+    return server
+
+
+@run_async
+async def start_server(  # pylint: disable=too-many-arguments,too-many-locals
+    *,
+    server_address: str = ADDRESS_FLEET_API_GRPC_BIDI,
+    server: Optional[Server] = None,
+    config: Optional[ServerConfig] = None,
+    strategy: Optional[Strategy] = None,
+    client_manager: Optional[ClientManager] = None,
+    grpc_max_message_length: int = GRPC_MAX_MESSAGE_LENGTH,
+    certificates: Optional[Tuple[bytes, bytes, bytes]] = None,
+) -> History:
+
+    event(EventType.START_SERVER_ENTER)
+
+    # Parse IP address
+    parsed_address = parse_address(server_address)
+    if not parsed_address:
+        sys.exit(f"Server IP address ({server_address}) cannot be parsed.")
+    host, port, is_v6 = parsed_address
+    address = f"[{host}]:{port}" if is_v6 else f"{host}:{port}"
+
+    # Initialize server and server config
+    initialized_server, initialized_config = init_defaults(
+        server=server,
+        config=config,
+        strategy=strategy,
+        client_manager=client_manager,
+    )
+    log(
+        INFO,
+        "Starting Flower server, config: %s",
+        initialized_config,
+    )
+
+    # Start gRPC server
+    active_strategy = initialized_server.strategy
+    placement = getattr(active_strategy, "placement_policy", None)
+    concurrency = getattr(
+        getattr(placement, "config", None),
+        "server_concurrency",
+        getattr(active_strategy, "server_concurrency", 1),
+    ) or 1
+    telemetry = LiveServerTelemetry(device=getattr(active_strategy, "runtime_device", "cpu"),
+                                    concurrency=concurrency)
+    bind_telemetry = getattr(placement, "bind_server_telemetry", None)
+    if bind_telemetry is not None:
+        bind_telemetry(telemetry)
+    grpc_server = await start_grpc_server(
+        client_manager=initialized_server.client_manager(),
+        server_model_manager=initialized_server.server_model_manager,
+        server_address=address,
+        max_message_length=grpc_max_message_length,
+        certificates=certificates,
+        telemetry=telemetry,
+        execution_concurrency=concurrency,
+    )
+    log(
+        INFO,
+        "Flower ECE: gRPC server running (%s rounds), SSL is %s",
+        initialized_config.num_rounds,
+        "enabled" if certificates is not None else "disabled",
+    )
+
+    # Start training
+    try:
+        run_fl_ = partial(run_fl, server=initialized_server, config=initialized_config)
+        hist = await asyncio.to_thread(run_fl_)
+
+    except Exception as e:  # pylint: disable=broad-except
+        log(ERROR, "Exception in start_server: %s", e)
+        log(ERROR, traceback.format_exc())
+        hist = None
+
+    finally:
+        await grpc_server.stop(grace=1)
+        await grpc_server.splitfleet_servicer.drain()
+        await asyncio.to_thread(grpc_server.splitfleet_servicer.shutdown_executor)
+
+    event(EventType.START_SERVER_LEAVE)
+
+    return hist

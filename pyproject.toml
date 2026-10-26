@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "splitfleet"
+version = "0.2.0"
+authors = [
+    {name="Boris Radovic", email="radovic.brs@gmail.com"}
+]
+requires-python = ">=3.11,<3.12"
+description = "Unified split learning framework with autosplitting built on top of Flower."
+readme = "README.md"
+classifiers = [
+    "Private :: Do Not Upload"
+]
+
+dependencies = [
+    "flwr==1.40.0",
+    "torchlens==2.34.1",
+    "torch>=2.11.0",
+    "numpy>=2.2.6",
+    "grpcio>=1.62.0",
+    "protobuf>=4.25.0",
+    "lz4>=4.3.0",
+]
+
+[project.optional-dependencies]
+simulation = [
+    "flwr[simulation]==1.40.0",
+]
+
+dev = [
+    "pytest>=8.3.0",
+    "grpcio-tools>=1.62.0",
+]
+
+experiment = [
+    "torchvision>=0.26.0",
+    "scipy>=1.15.3",
+    "matplotlib>=3.10.0",
+]
+
+integration = [
+    "torchvision>=0.26.0",
+    "timm>=1.0.26",
+    "ultralytics>=8.4.41",
+    "rfdetr>=1.6.5",
+    "transformers>=4.0.0",
+]
+
+tensorflow = ["tensorflow>=2.16"]
+paddle = ["paddlepaddle>=3.0"]
+multibackend = [
+    "tensorflow>=2.16",
+    "paddlepaddle>=3.0",
+]
+
+[tool.uv.sources]
+torchlens = { path = "./torchlens-2.34.1-py3-none-any.whl" }
+
+[tool.setuptools.packages.find]
+include = ["splitfleet*", "experiments*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "integration: real-model or optional-dependency integration checks",
+    "simulation: executes the native Flower/Ray simulation runtime",
+]
