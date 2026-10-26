@@ -1,408 +1,250 @@
 # SplitFleet
 
-SplitFleet also supports real virtual split learning through Flower/Ray. See
-[Virtual SFL Runtime](experiments/virtual_sfl/README.md) for the CPU smoke entry,
-100-client real-data training, state isolation, bounded suffix replicas, network
-constraints and measured Greedy placement. The current paper retains the paired
-100-client, 50-round PyTorch result; see the [paper evidence guide](paper/README.md).
-Physical TensorFlow/Paddle training uses
-[six CPU/GPU clients on three Orins](experiments/resnet50_backends/README.md).
+**A Unified Framework for Resource-Adaptive Split Federated Learning**
 
-SplitFleet combines a unified split federated learning (SFL) abstraction, SFL-grade fine-grained partitioning, and measured Greedy placement. Built on [Flower](https://flower.ai/), it separates backend, task, partition, aggregation, and placement contracts. Three backend adapters implement the same SFL execution contract.
+SplitFleet is a research framework for collaborative training across edge devices with heterogeneous compute, memory, and network resources. It combines automatic operation-level model partitioning with measured, per-client cut placement, built on Flower orchestration and TorchLens split execution.
 
-The unified task interface covers image classification, text classification, object detection, semantic segmentation, and instance segmentation.
-Maintained experiment protocols are in `experiments/`; the local manuscript and evidence guide is `paper/README.md`.
-Dataset-level integrations can be registered through `TaskSpec`/`TaskRegistry`, which bind a task adapter, model and dataset factories, metrics, and candidate cuts without coupling the split runtime to a dataset package.
-Greedy is the default adaptive policy, with one server suffix execution slot (`C=1`). Each client selects its lowest predicted complete-round cost from the admitted cuts. Restored training calibration supplies initial compute and communication costs; actual fit feedback updates private client cost tables. Per-batch costs are multiplied by the local batch count, and model-state exchange is counted once per round. Calibration time is included in complete job time.
+Each client runs a model prefix locally and offloads the remaining suffix to a server. SplitFleet exchanges the complete boundary frontier, propagates gradients back to the client, and reconstructs each client's complete model update before federated aggregation. Clients can use different cuts while training the same logical global model.
 
-Physical PyTorch calibration synchronizes current global weights and restores model state and random streams after temporary optimizer steps. Evaluation does not initialize training costs. Compatible saved Greedy cost tables can resume without repeating calibration. See the [Greedy guide](experiments/GREEDY.md) and [physical experiment guide](experiments/README.md).
+[Overview](#overview) · [Paper results](#paper-results) · [Installation](#installation) · [Quickstart](#quickstart) · [Adaptive placement](#adaptive-placement) · [Repository guide](#repository-guide)
 
-The autosplit runtime is backed by the repository-local `torchlens-2.34.1-py3-none-any.whl` via `uv.sources`. SplitFleet uses its native split APIs and maintains no local TorchLens patches or wheel builder. Candidate catalogs use `analyze()` for plans and capability reports; selected training cuts use `at()` to build executable segments. SplitFleet handles Flower strategy integration, client/server transport, server-tail replicas, and aggregation policy.
+## Overview
 
-The local wheel's native split extensions are distinct from the execution-capture capabilities documented by [upstream TorchLens](https://github.com/johnmarktaylor91/torchlens). Graph capture alone does not establish a valid training partition. Catalog admission checks the captured graph, training support, state ownership and boundary ABI; numerical correctness requires execution checks. Canonical split identities and graph/schema hashes identify boundaries across compatible devices, while runtime operation positions are cost features.
+- **Fine-grained split training.** Discover operation-level cuts from captured execution graphs and preserve cross-cut dependencies in models with residual connections, branches, and multiple inputs or outputs.
+- **Explicit training admission.** Check replay, gradient propagation, state ownership, and boundary compatibility before using a cut for training. Boundary contracts identify the graph, cut, backend, tensor schema, and batch window.
+- **Resource-adaptive placement.** Calibrate computation and communication costs, choose the lowest predicted local-round cost independently for each client, and update estimates from runtime feedback.
+- **Complete federated updates.** Maintain independent server-suffix replicas and optimizer state per client, reconstruct prefix-owned and suffix-owned state, and aggregate successful updates by sample count.
+- **Reusable task and backend interfaces.** Separate model execution, task losses, dataset integration, cut placement, and aggregation. Backend adapters cover PyTorch, TensorFlow, and PaddlePaddle.
 
-Boundary features and gradients use typed tensor envelopes, graph contracts, SHA-256 checks and resource limits.
+### Training workflow
 
-TorchLens-backed split replay and training can also be enabled for TensorFlow and
-Paddle through the corresponding optional dependency groups (`tensorflow` and
-`paddle`). MLX and ONNX are not exposed as SplitFleet training backends.
+```mermaid
+flowchart LR
+    G[Global model] --> P[Per-client cut placement]
+    P --> C[Client prefix]
+    C -->|Frontier activations| S[Client-specific server suffix]
+    S -->|Frontier gradients| C
+    C --> R[Reconstruct complete client updates]
+    S --> R
+    R --> A[Sample-weighted aggregation]
+    A --> G
+    S -. Runtime feedback .-> P
+    C -. Runtime feedback .-> P
+```
 
-## What This Project Does
+A frontier contains every tensor needed across a cut, including dependencies that bypass the immediately preceding operation. The server computes the task loss and suffix backward pass; the client uses returned frontier gradients to complete prefix backpropagation. At the end of local training, the framework reconstructs each successful client's full update according to state ownership. If a round has no complete successful updates, it retains the previous global model.
 
-Given a model in a registered backend and example positional/keyword inputs, SplitFleet prepares a TorchLens split runtime, runs a client-local prefix, sends a typed `BoundaryPayload` to the server suffix, and completes split inference or split training inside the Flower round loop.
+### Tasks, models, and backends
 
-Split points may be selected before/after captured operations or by percentage.
-Support is determined for each captured graph, backend, input schema, and training
-mode; an untraceable model or unsupported operation is reported explicitly.
-This is not a promise that every possible model or Python execution path can be split.
+| Task interface | Representative architectures studied in the manuscript |
+| --- | --- |
+| Image classification | ResNet-50, MobileNetV3-Large |
+| Text classification | BERT-base, DistilBERT |
+| Object detection | RF-DETR Nano, YOLO26n |
+| Semantic segmentation | DeepLabV3-ResNet50 |
+| Instance segmentation | Additional task adapter and synthetic validation fixtures |
 
-Currently supported:
+The seven-architecture study uses the PyTorch execution path. TensorFlow and PaddlePaddle are evaluated separately with ResNet-50 on physical clients. Instance segmentation is an API capability; it is outside the manuscript's four-task performance evaluation. Executable cuts depend on the model, backend, input shape, and training-admission checks.
 
-- positional and keyword model inputs, including text input mappings
-- task-aware batches and losses, including list-of-images detection batches
-- inspectable backend availability through `BACKEND_ADAPTERS.availability()`
-- client prefix and coordinator/server suffix
-- split inference
-- split training with suffix gradients returned to the prefix
-- shared server tail
-- per-client server tail
-- one per-round dynamic placement policy interface through
-  `AutoSplitStrategy.placement_policy`
-- measured placement through
-  [`GreedyPlacementPolicy`](splitfleet/server/placement/greedy/policy.py)
-- a fleet-wide dynamic batch window negotiated by the strategy, permitting
-  heterogeneous batch sizes when native TorchLens batch validation succeeds
-- SplitFed-style client and server aggregation
-- ownership-based aggregation of per-client prefix/suffix updates in physical PyTorch SplitFleet runs
-- `BoundaryPayload` serialization through SplitFleet's typed wire envelopes
+## Paper results
 
-Currently not supported:
+The companion manuscript evaluates a primary testbed of **three Jetson Orin devices and an RTX A6000 server**. The table summarizes two separate protocols from Section 6.2: mean training-time reduction over ten synchronous rounds, and model quality under a common wall-clock budget.
 
-- arbitrary multi-stage worker placement
-- non-contiguous client/server stage ownership
+| Workload | Ten-round time reduction vs. FedAvg | Time budget | SplitFleet quality at the deadline |
+| --- | ---: | ---: | ---: |
+| ResNet-50 / CIFAR-10 | 35.3% | 300 s | 56.80% accuracy |
+| BERT-base / AG News | 43.9% | 500 s | 88.44% macro-F1 |
+| RF-DETR Nano / VOC2007 | 56.5% | 500 s | 89.63% mAP@0.5 |
+| DeepLabV3-ResNet50 / Oxford-IIIT Pet | 73.0% | 600 s | 77.44% mIoU |
+
+Both protocols use five paired seeds. The ten-round comparison uses 240 training and 200 test examples per task, with matched initialization, partitions, and training settings within each seed. In the time-budget comparison, SplitFleet has the highest mean quality among the eight evaluated methods on image classification, text classification, and semantic segmentation; RF-DETR Nano is competitive with FedCompass and Fixed-75. These measurements describe the manuscript's workloads and experimental settings.
+
+Additional experiments in Section 6.3 report:
+
+- **100 virtual clients:** 50 synchronous ResNet-50/CIFAR-10 rounds on one H100 host, using 16 CPU workers and GPU suffix execution. All clients participate each round, with 45,000 training and 5,000 test examples. Final test accuracy is 93.76% for SplitFleet and 93.64% for FedAvg.
+- **Physical multi-backend training:** TensorFlow and PaddlePaddle each complete 50 rounds of ResNet-50/CIFAR-10 training from scratch with six CPU/GPU client instances across three Orins and an A6000 server. Final independent test accuracies are 74.20% and 76.86%, respectively.
+
+These are reported paper results. The public snapshot contains the framework and synthetic validation code; the experiment launchers, datasets, raw measurements, and manuscript artifacts needed to reproduce the paper's complete evaluation are outside this release.
 
 ## Installation
 
-Python `3.11` is required.
+Use **Python 3.11**. The project pins **Flower 1.40.0** and **TorchLens 2.34.1**, and requires **PyTorch >= 2.11.0**. See [pyproject.toml](pyproject.toml) for the dependency declarations.
+
+The recommended installation uses `uv` and the repository lockfile:
 
 ```bash
-uv sync --extra dev
+git clone https://github.com/SplitFleet-sys/SplitFleet.git
+cd SplitFleet
+uv sync --python 3.11
 ```
 
-When the repository-local TorchLens wheel or lockfile changes, force uv to forget any cached TorchLens install before validating runtime behavior:
+The [bundled TorchLens wheel](torchlens-2.34.1-py3-none-any.whl) is selected by `tool.uv.sources` and recorded in [uv.lock](uv.lock). Keep it in place: the runtime checks the exact TorchLens version and uses its split-training API.
+
+Verify the selected versions:
 
 ```bash
-uv lock
-uv cache clean torchlens
-uv sync --extra dev --reinstall-package torchlens
+uv run python -c "from importlib.metadata import version; print({p: version(p) for p in ('splitfleet', 'torchlens', 'flwr')})"
 ```
 
-Install the real-model integration dependencies when validating the model matrix:
+Optional backend dependencies can be installed with the corresponding extra:
 
 ```bash
-uv sync --extra dev --extra integration
+uv sync --python 3.11 --extra tensorflow
 ```
 
-Install every training backend when validating cross-framework split learning:
+Other extras include `paddle`, `multibackend`, `integration` for model integrations, and `simulation` for Flower/Ray dependencies. Installing the simulation extra alone does not supply the omitted experiment helpers described in [Release scope](#release-scope). GPU deployments also require backend builds appropriate to the device and CUDA environment.
 
-```bash
-uv sync --extra dev --extra integration --extra multibackend --reinstall-package torchlens
-```
+## Quickstart
 
-## Quick Start
+### Run a local split-training step
 
-Run the download-free task correctness matrix (image/text classification, detection,
-semantic and instance segmentation; PyTorch):
-
-```bash
-uv run --no-sync python -m splitfleet.validation --backends torch --all-nodes \
-  --output results/unified_task_validation.json
-```
-
-The JSON compares outputs, task losses, all parameter gradients and one SGD step
-at every enumerated before/after boundary, including activation and gradient wire
-round trips. Unsupported and failed cases have separate outcomes and nonzero exit
-codes. These synthetic checks do not measure dataset accuracy or convergence.
-The full task-equivalence matrix covers PyTorch. TensorFlow and Paddle have
-separate native replay/training, task-loss and split-node checks.
-
-Run the TorchLens split training demo:
-
-```bash
-uv run --no-sync python examples/torchlens_split_training_demo.py
-```
-
-Run the default test suite:
-
-```bash
-uv run --no-sync pytest
-```
-
-Run the complete suite, including the gated heavy detection checks, with all
-backend and task dependencies installed:
-
-```bash
-SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
-MKL_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false \
-  uv run --no-sync pytest tests --tb=short -ra
-```
-
-The heavy switches execute the gated tests; they keep the default suite smaller.
-
-Run the real-model task matrix:
-
-```bash
-uv run --no-sync pytest tests/integration/test_torchlens_real_task_matrix.py -q
-```
-
-The matrix validates Hugging Face BERT/DistilBERT/RoBERTa, CNN classifiers,
-torchvision detection heads, and semantic-segmentation models. Swin training
-and DeepLab training use explicit fixed-shape captures where TorchLens refuses
-dynamic batch replay; the tests preserve those refusals as part of the contract.
-
-Run optional heavy detection checks:
-
-```bash
-SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 uv run --no-sync pytest tests/integration/test_torchlens_real_detection_optional.py -q
-```
-
-The heavy checks validate YOLOv8 and RF-DETR in addition to the default
-torchvision Faster R-CNN and RetinaNet coverage.
-
-## Example: AutoSplit Strategy
-
-The main entrypoint is [`AutoSplitStrategy`](splitfleet/server/strategy/autosplit_strategy.py).
+Save the following as `quickstart.py`. It uses synthetic data and the public `AutoSplitSession` API to run the prefix forward pass, suffix loss and backward pass, and prefix backward pass on the CPU.
 
 ```python
 import torch
 from torch import nn
 
-from splitfleet.client.autosplit_split_client import AutoSplitSplitLearningClient
-from splitfleet.server.strategy import AutoSplitStrategy
+from splitfleet.autosplit import AutoSplitSession
 
-model = MyModel()
-sample_inputs = torch.randn(2, 3, 224, 224)
+
+def make_model():
+    return nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
+
+
+torch.manual_seed(7)
+model = make_model().train()
+sample_inputs = torch.randn(2, 4)
+targets = torch.tensor([0, 1])
+
+session = AutoSplitSession(device="cpu")
+runtime = session.prepare_runtime(
+    model,
+    sample_inputs,
+    boundary="50%",
+    trainable=True,
+    dynamic_batch=(2, 8),
+)
+
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+result = session.run_train(
+    runtime,
+    sample_inputs,
+    targets,
+    loss_fn=nn.CrossEntropyLoss(),
+    prefix_optimizer=optimizer,
+    suffix_optimizer=optimizer,
+)
+
+print(f"boundary={runtime.plan.boundary}")
+print(f"loss={result['loss'].detach().item():.6f}")
+```
+
+```bash
+uv run python quickstart.py
+```
+
+This is one split-training step in a single process. A federated deployment additionally needs client data loaders, independent client/server model replicas, RPC connections, and round orchestration. The shared stateless SGD optimizer above is suitable for this local example; distributed stages and clients maintain their own optimizer state.
+
+### Validate split execution
+
+The validation CLI is included in this repository and downloads no datasets or pretrained weights:
+
+```bash
+uv run python -m splitfleet.validation --backends torch --tasks image_classification --output results/validation-image.json
+```
+
+To check every enumerated boundary of the synthetic fixtures for all five task families:
+
+```bash
+uv run python -m splitfleet.validation --backends torch --all-nodes --output results/validation-all.json
+```
+
+Reports compare model outputs, task losses, all parameter gradients, and one SGD update against native execution, including activation and boundary-gradient serialization round trips. The default samples up to four boundaries per task; `--all-nodes` checks every enumerated before/after boundary. Exit codes are `0` for passed, `1` for failed, and `2` for partial or unsupported results. These fixtures check synthetic task correctness; they do not reproduce the paper's model-quality or convergence experiments. The CLI currently accepts the PyTorch backend only.
+
+## Adaptive placement
+
+`GreedyPlacementPolicy` is the measured adaptive policy provided by the framework. For client `i` and candidate cut `c`, its cost model is:
+
+```text
+predicted_round_cost(i, c) = local_batches(i) * (
+    client_compute(i, c) + server_compute(i, c) + boundary_rpc(i, c)
+) + model_state_exchange(i, c)
+```
+
+Computation and boundary communication are charged per local batch; model-state exchange is charged once per round. Calibration measures admitted structural anchors and restores training state afterward. Successful training feedback updates each client's cost estimates; failed executions affect feasibility and cooldown without becoming latency samples. A client's chosen cut stays fixed for that local round.
+
+To configure the policy, reuse the imports, model factory, and sample batch from the quickstart with a fresh model:
+
+```python
+from splitfleet.server.placement import (
+    GreedyConfig,
+    GreedyPlacementPolicy,
+    TorchLensCandidateProvider,
+)
+from splitfleet.server.strategy import AutoSplitStrategy
+from splitfleet.tasks import ImageClassificationTask, ModelInputs, TaskBatch
+
+model = make_model()
+sample_batch = TaskBatch(ModelInputs.from_value(sample_inputs), targets)
+placement = GreedyPlacementPolicy(
+    candidate_provider=TorchLensCandidateProvider(
+        model=model,
+        sample_inputs=sample_batch.inputs,
+    ),
+    config=GreedyConfig(server_concurrency=1),
+)
 
 strategy = AutoSplitStrategy(
     model=model,
-    sample_inputs=sample_inputs,
-    boundary="50%",
-    client_stage_count=1,
+    sample_inputs=sample_batch,
+    task=ImageClassificationTask(),
+    placement_policy=placement,
     aggregation_policy="splitfed",
-    dynamic_batch=(1, 256),
-    loss_fn=nn.CrossEntropyLoss(),
-    optimizer_fn=lambda m: torch.optim.SGD(m.parameters(), lr=0.01),
+    optimizer_fn=lambda module: torch.optim.SGD(module.parameters(), lr=0.01),
     min_fit_clients=2,
     min_evaluate_clients=2,
     min_available_clients=2,
 )
-
-client = AutoSplitSplitLearningClient(
-    model=model,
-    train_data=train_loader,
-    evaluate_data=val_loader,
-    sample_inputs=sample_inputs,
-    optimizer_fn=lambda m: torch.optim.SGD(m.parameters(), lr=0.01),
-)
 ```
 
-## Cross-Device, Cross-Batch Rounds
+This constructs a strategy; it does not start a distributed job. Integrate it with [start_server](splitfleet/server/app.py) and construct clients with [AutoSplitSplitLearningClient](splitfleet/client/autosplit_split_client.py), matching their task, model, calibration batch, and optimizer configuration. The strategy uses a fixed `boundary="50%"` when no placement policy is supplied; pass a policy explicitly to enable adaptive selection.
 
-### One negotiated batch window for the whole fleet
+The default policy configuration uses one suffix execution slot (`C=1`) while retaining independent per-client suffix replicas. Increasing `server_concurrency` changes execution capacity on the server, not the number of GPUs. Cut selection minimizes each client's predicted cost independently; shared-server queueing and joint multi-client placement are outside the current scoring model.
 
-`dynamic_batch=(min, max)` is planned once by the strategy, travels in the round
-config, and is what every device prepares its prefix runtime with. Devices
-can keep local batch sizes, including a short trailing batch, when both the
-negotiated window and native TorchLens batch validation allow them. The window is
-part of the feature ABI, so a device that disagrees is rejected at round setup
-instead of at the first boundary upload.
+## Repository guide
 
-For a runtime with inferred or declared batch axes, omitting `dynamic_batch`
-defaults the window to `(2, 64)` for a sample batch greater than one and `(1, 64)`
-otherwise. Fixed-shape captures do not infer a dynamic window.
+| Path | Purpose |
+| --- | --- |
+| [splitfleet/autosplit/](splitfleet/autosplit) | Graph capture, cut planning, runtime sessions, boundary contracts, and serialization |
+| [splitfleet/backends/](splitfleet/backends) | Backend adapters and common tensor/model operations |
+| [splitfleet/tasks/](splitfleet/tasks) | Task adapters, metrics, and `TaskSpec` / `TaskRegistry` integration |
+| [splitfleet/client/](splitfleet/client) | Client-prefix execution and RPC communication |
+| [splitfleet/server/strategy/](splitfleet/server/strategy) | Split metadata, round configuration, reconstruction, and aggregation |
+| [splitfleet/server/placement/greedy/](splitfleet/server/placement/greedy) | Candidate discovery, calibration, private cost tables, feasibility, and feedback |
+| [splitfleet/server/stage_runtime/](splitfleet/server/stage_runtime) | Server-suffix runtime management |
+| [splitfleet/runtime/](splitfleet/runtime) | Backend execution, auxiliary state, and prefix-context ownership |
+| [splitfleet/split_engine/](splitfleet/split_engine) | Split-engine interfaces and graph/model contracts |
+| [splitfleet/transport/](splitfleet/transport) | Activation, gradient, and tensor-bundle wire formats |
+| [splitfleet/validation/](splitfleet/validation) | Synthetic task-equivalence CLI |
+| [splitfleet/virtual/](splitfleet/virtual) | Virtual-client runtime source; see release scope below |
+| [proto/](proto) | RPC protocol definitions |
+| [dependency_patches/](dependency_patches) | Dependency patch notices and third-party license texts |
 
-The window is an admission constraint, not proof of shape generalization.
-`batch_axes` declares the model-call inputs and dimensions that carry the batch;
-for example, `{"/args/0": 1}` for a `[T, B, C]` input. A missing or failed native
-batch probe still rejects changed batches even when they are inside the window.
+## Release scope
 
-Pass `batch_axes={}` to capture the exact example shape without dynamic batch
-axes. Set it on both `AutoSplitStrategy` and `AutoSplitSplitLearningClient`, with
-matching sample shapes, and keep the data-loader batch shape fixed. This is the
-explicit training path used by the BatchNorm1d, DeepLab and Swin configurations
-whose native dynamic batch probes cannot validate replay. Fixed-shape examples and native limitations are covered by the batch-window tests and the full-model protocol in `experiments/EXECUTION_COVERAGE.md`.
-Changing a fixed input shape requires a separate capture; widening
-`dynamic_batch` does not make that shape dynamic.
+This public snapshot excludes `examples/`, `experiments/`, and `tests/`. The quickstart and validation commands above use code included in the snapshot. The historical completion report at the repository root describes development artifacts and is not an index of files available in this release.
 
-A batch outside the window is refused by the prefix before it is uploaded and by
-the suffix before it is executed, naming the observed batch and the window. Set
-`partial_batch_policy="skip"` on the split client to drop such batches instead;
-the dropped batch and example counts are reported in the round metrics rather
-than silently absorbed. This skip policy does not handle fixed-shape mismatches
-or native batch-probe failures inside the admitted window.
+Virtual-runtime sources are present, but they currently import helpers from the omitted experiment package, including TCP pacing and Dirichlet data partitioning. The paper's virtual-client runs and high-level configuration listing therefore cannot be launched directly from this snapshot. The manuscript's listing is conceptual; use the concrete APIs shown above when integrating the public code.
 
-### Greedy placement across heterogeneous devices
+Additional execution constraints:
 
-The default physical and virtual adaptive entrypoints use Greedy and `C=1`. TorchLens supplies admitted operation-level cuts; Greedy chooses a cut independently for each selected client once per federated round. `boundary="auto"` enables discovery in the lower-level strategy API; pass a placement policy to enable adaptation there.
+- The current autosplit planner supports two stages: one client prefix and one server suffix.
+- A negotiated `dynamic_batch` range admits batch sizes only when native replay validation supports them. Use matching `batch_axes={}` settings for an explicit fixed-shape capture.
+- Training admission does not establish numerical equivalence for every model or cut. Validate outputs, losses, gradients, and optimizer updates for the workload you use. Matching full-model FedAvg additionally depends on local work, optimizer state, buffers, randomness, and numerical execution.
+- Parameters written by both stages require compatible ownership and update semantics. SplitFed rejects dual-stage tied updates by default; the explicit `tied_weight_update_mode="additive_sgd"` option is restricted to matching stateless SGD without weight decay.
 
-```python
-from splitfleet.tasks import ImageClassificationTask, ModelInputs, TaskBatch
-from splitfleet.server.strategy import AutoSplitStrategy
-from splitfleet.server.placement import GreedyConfig, GreedyPlacementPolicy, TorchLensCandidateProvider
+## Paper and attribution
 
-sample = TaskBatch(ModelInputs.from_value(sample_inputs), sample_targets)
-placement = GreedyPlacementPolicy(
-    candidate_provider=TorchLensCandidateProvider(model=model, sample_inputs=sample.inputs),
-    config=GreedyConfig(server_concurrency=1),
-)
-strategy = AutoSplitStrategy(
-    model=model,
-    sample_inputs=sample,
-    task=ImageClassificationTask(),
-    placement_policy=placement,
-    aggregation_policy="splitfed",
-    optimizer_fn=lambda parameters: torch.optim.SGD(parameters, lr=0.005),
-)
-```
+The companion manuscript is titled **SplitFleet: A Unified Framework for Resource-Adaptive Split Federated Learning**. The results above refer to Sections 6.2 and 6.3. When referring to a specific implementation, reference [this repository](https://github.com/SplitFleet-sys/SplitFleet) and the commit you used.
 
-Provide each worker's representative task batch and matching optimizer as well. Calibration measures four admitted structural anchors, restores state, and initializes private affine communication costs. Successful training feedback updates measured computation and link costs; failures update feasibility. The policy uses no confidence-bound exploration or joint cut solver. Recorded server load is diagnostic and is not a Greedy scoring feature.
-
-Set `--server-concurrency N` to permit up to `N` suffix executions on the same GPU. This changes execution capacity, not the number of GPUs. Each client retains a private suffix model and optimizer. At `C=1` their execution is serialized while client prefixes may overlap. Higher capacities can reduce queue wait while increasing service spans and need not reduce complete job time.
-
-SplitFed reconstructs each client's complete logical update from its owned prefix and suffix states and then performs sample-weighted aggregation. FedAvg equivalence requires matched local work, optimizer state, buffers, randomness and numerical execution. Missing prefix/suffix pairs are dropped together; a round with no complete update preserves the previous global model.
-
-The current paper uses the original measured Greedy endpoints as SplitFleet (`C=1`), with original hashes and labels retained. Historical controller runs remain immutable evidence; the active Greedy refactor has not been performance-rerun. See [the paper and evidence guide](paper/README.md).
-
-### Weight-tied models
-
-A tensor shared by several state-dict names (tied embeddings, a decoder reusing
-its encoder weight) can be written by both stages. SplitFed rejects a dual-stage
-tied update by default: independently transformed Adam, momentum, weight-decay,
-or mismatched-learning-rate updates cannot be combined into one correct logical
-step. Callers that guarantee identical stateless SGD without weight decay on
-both stages may opt into `tied_weight_update_mode="additive_sgd"`; only in that
-mode are the two deltas summed. Shared buffers are not treated as tied.
-
-## Main Components
-
-- [`splitfleet/autosplit`](splitfleet/autosplit): TorchLens adapter, two-stage planner, runtime facade, serde, and cache.
-- [`splitfleet/server/strategy/autosplit_strategy.py`](splitfleet/server/strategy/autosplit_strategy.py): Flower strategy metadata and aggregation policy.
-- [`splitfleet/server/placement/greedy`](splitfleet/server/placement/greedy): the default measured policy, including private cost tables, feasibility, calibration, feedback and state.
-- [`splitfleet/autosplit/batch_window.py`](splitfleet/autosplit/batch_window.py): the dynamic batch window contract shared by the prefix and the suffix.
-- [`splitfleet/server/stage_runtime`](splitfleet/server/stage_runtime): active TorchLens runtime handle management for coordinator-local suffix execution.
-- [`splitfleet/server/server_model/autosplit_tail_server_model.py`](splitfleet/server/server_model/autosplit_tail_server_model.py): server suffix model bridge.
-- [`splitfleet/client/autosplit_split_client.py`](splitfleet/client/autosplit_split_client.py): client prefix execution and boundary payload exchange.
-
-## Runtime Invariants
-
-- Runtime validation requires the installed `torchlens==2.34.1`. `uv.sources` and the wheel hash in `uv.lock` select the repository wheel. Runtime contracts record adapter identity; incompatible contracts must be regenerated.
-- Runtimes use TorchLens `prepare`; split-point discovery, analysis, and repartition use the public `split_points`, `analyze`, and `at` methods. Unsupported points remain visible in candidate diagnostics.
-- `BoundaryPayload` serialization is self-contained: tensors, a stable `BoundarySpec`, and portable replay metadata survive cross-process transport. The optional native TorchLens object and local autograd state are not required on the receiving side.
-- Feature ABI identifiers are schema-only. They include labels, dtype, symbolic shape, layout, passthrough/preprocessing schema, trace mode, dynamic batch, model/runtime identifiers, and TorchLens version, but exclude sample tensor values, concrete sample batch values, target values, device, temporary runtime ids, and validation inputs.
-- Flower autosplit config is JSON-stable. Strategy, client, and server code exchange deterministic runtime contract JSON, contract digests, feature ABI ids, boundary labels, trace batch mode, dynamic batch, backend, and TorchLens version.
-- Boundary uploads are rejected before suffix execution when runtime backend, TorchLens version, feature ABI id, runtime contract digest, boundary label order, batch size, trace batch mode, or dynamic batch do not match the prepared server runtime.
-- The dynamic batch window is negotiated once per placement by the strategy. Clients adopt the broadcast window instead of inferring one, and a client whose prepared prefix does not reproduce the announced feature ABI id fails the round before uploading a boundary.
-- `backward_prefix` calls the pinned TorchLens runtime's training API directly.
-- Runtime preparation, optimizer construction and semantic split lookup failures propagate to the caller. Training does not continue with an unprepared runtime, missing optimizer implementation or guessed semantic boundary.
-- Under `ReplicaScope.PER_CLIENT`, the prefix and suffix halves of a round are aggregated by two different calls, so `aggregate_fit` returns `None` for the client-side model and `Strategy.finalize_round` returns the reassembled logical model. No call path can publish a model whose suffix half is a round stale: a caller that skips `finalize_round` keeps the previous global parameters.
-- Suffix timing measurements always contain `server_total_ms`. PyTorch measures its complete suffix-service wall span, including boundary roots, task loss/matching, backward and optimizer work, and reports `server_loss_ms` through client telemetry. Phase timings are reported only by backends that measure them.
-- Per-round aggregation state is dropped when the next round is configured, so a round that never reaches `aggregate_server_fit` cannot retain a copy of the client and server models.
-
-## Validation
-
-The [execution coverage guide](experiments/EXECUTION_COVERAGE.md) describes complete cut catalogs and paired training checks. Audit the retained physical study without rewriting its results:
-
-```bash
-.venv/bin/python paper/refresh_evidence.py --output-dir /tmp/splitfleet_evidence_audit --use-checkpoint-receipts
-```
-
-Completed training weights and unused input copies have been pruned. This audit
-recomputes statistics from retained results and uses the recorded pre-pruning
-checkpoint checks; it does not reload deleted weights. The four RQ1 input bundles
-remain. See [storage cleanup](paper/evidence/storage_cleanup_receipt.json).
-
-The manuscript's retained cohorts and required support files are listed in
-[results/README.md](results/README.md). Unused pilots, intermediate analyses,
-unexecuted plans and duplicate experiment snapshots have been pruned. The
-[experiment cleanup receipt](paper/evidence/unused_experiment_cleanup_receipt.json)
-records removed paths and checks that cited raw results, failures, inputs and
-figures retain their original hashes.
-
-New experiment runs default to compact storage. Servers keep numerical results,
-failures and a final in-memory finite/hash check; full task weights require
-`--save-model`. Prepared server/client bundles reference shared weights and data,
-and derived role descriptors reuse those tensors. The physical
-matrix deletes its owned inputs after it stops its workers, including on failure;
-use `--keep-input-bundles` to retain them for replay or debugging. Manifests,
-input hashes, frozen source and logs remain. Standalone input preparation keeps
-its shared assets for subsequent runs; it cannot delete inputs used by other jobs.
-
-TorchLens 2.34.1 wheel and API checks:
-
-```bash
-uv lock
-uv cache clean torchlens
-uv sync --extra dev --reinstall-package torchlens
-uv run python -c "import torchlens as tl; print(tl.__file__); print(tl.__version__); assert tl.__version__ == '2.34.1'"
-uv run python -c "from torchlens.split import ReplayBoundary, prepare; print('torchlens 2.34.1 split api ok')"
-```
-
-Default checks:
-
-```bash
-uv run --no-sync pytest -q
-uv run --no-sync pytest tests/unit/test_torchlens_split_engine.py -q
-uv run --no-sync pytest tests/unit/test_torchlens_boundary_serde.py -q
-uv run --no-sync pytest tests/unit/test_torchlens_candidate_contract.py -q
-uv run --no-sync pytest tests/unit/test_stage_runtime_contract.py -q
-uv run --no-sync pytest tests/unit/test_batch_window.py -q
-uv run --no-sync pytest tests/test_greedy_placement.py tests/test_greedy_calibration.py -q
-uv run --no-sync pytest tests/test_cross_device_cross_batch.py -q
-uv run --no-sync pytest tests/test_splitfed_aggregation.py -q
-uv run --no-sync pytest tests/test_server_round_finalization.py -q
-```
-
-`tests/test_cross_device_cross_batch.py` covers the cross-device and cross-batch
-round behaviour: window broadcast and adoption, heterogeneous batch sizes in one
-round, prefix and suffix rejection of out-of-window batches, the skip policy,
-feature-ABI refusal, Greedy placement through the strategy, and
-SplitFed aggregation with a missing suffix replica.
-
-Integration checks:
-
-```bash
-uv run --no-sync pytest tests/integration/test_torchlens_runtime_replay.py -q
-uv run --no-sync pytest tests/integration/test_torchlens_real_task_matrix.py -q
-SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 uv run --no-sync pytest tests/integration/test_torchlens_real_detection_optional.py -q
-```
-
-To include the full native controls, install the optional backends and detection
-dependencies, and select a separate GPU Paddle environment (the CPU and GPU
-wheels share the same import name):
-
-```bash
-SPLITFLEET_PADDLE_PYTHON="$PWD/.venv-paddle-gpu/bin/python" \
-SPLITFLEET_FULL_PADDLE_CONTROL=1 \
-SPLITFLEET_FULL_OWNERSHIP_TESTS=1 \
-SPLITFLEET_NATIVE_CALIBRATION_BACKEND=pytorch \
-SPLITFLEET_NATIVE_CALIBRATION_DEVICE=cpu \
-SPLITFLEET_RUN_HEAVY_REAL_MODELS=1 \
-uv run --no-sync pytest -ra
-```
-
-The GPU controls require two real GPUs and the ResNet50 gate's CIFAR-10 data.
-Native framework controls use fresh processes; TensorFlow test imports default
-to growing GPU allocations so they can coexist with child controls.
-Missing dependencies or devices remain explicit skips in the report.
-
-ResNet18 training correctness check:
-
-```bash
-uv sync --extra dev --extra integration --reinstall-package torchlens
-uv run --no-sync pytest tests/integration/test_torchlens_real_task_matrix.py -k "torchvision_resnet18" -q
-```
-
-The ResNet18 check verifies that a split training step matches the full-model step, including loss, BatchNorm state, and parameter updates after the optimizer step.
-
-Cleanup checks:
-
-```bash
-rg 'torchlens-2\.31\.0|torchlens==2\.31\.0' splitfleet tests examples README.md pyproject.toml uv.lock
-rg -i "[a]riadne" splitfleet tests examples README.md pyproject.toml uv.lock
-```
-
-## Paper
-
-If you use the framework in research, the original SplitBud paper is still the best citation context for the project lineage:
-
-```bibtex
-@inproceedings{Radovic-SplitBud,
-  author = {Radovič, Boris and Canini, Marco and Horváth, Samuel and Pejović, Veljko and Vepakomma, Praneeth},
-  booktitle = {Proceedings of the 5th Workshop on Machine Learning and Systems (EuroMLSys '25)},
-  title = {Towards a Unified Framework for Split Learning},
-  year = {2025},
-  pages = {183--191},
-  doi = {10.1145/3721146.3721936},
-  url = {https://euromlsys.eu/pdf/euromlsys25-7.pdf}
-}
-```
+SplitFleet builds on Flower for federated orchestration and TorchLens for graph capture and split execution, with project lineage from SplitBud. Notices for bundled or patched third-party components are collected in [dependency_patches/](dependency_patches).
