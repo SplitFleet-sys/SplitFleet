@@ -18,19 +18,9 @@ Each client runs a model prefix locally and offloads the remaining suffix to a s
 
 ### Training workflow
 
-```mermaid
-flowchart LR
-    G[Global model] --> P[Per-client cut placement]
-    P --> C[Client prefix]
-    C -->|Frontier activations| S[Client-specific server suffix]
-    S -->|Frontier gradients| C
-    C --> R[Reconstruct complete client updates]
-    S --> R
-    R --> A[Sample-weighted aggregation]
-    A --> G
-    S -. Runtime feedback .-> P
-    C -. Runtime feedback .-> P
-```
+![SplitFleet architecture](assets/splitfleet-architecture.png)
+
+*Figure 2: SplitFleet architecture, from task and backend interfaces to global orchestration and the split-training runtime.*
 
 A frontier contains every tensor needed across a cut, including dependencies that bypass the immediately preceding operation. The server computes the task loss and suffix backward pass; the client uses returned frontier gradients to complete prefix backpropagation. At the end of local training, the framework reconstructs each successful client's full update according to state ownership. If a round has no complete successful updates, it retains the previous global model.
 
@@ -70,12 +60,12 @@ These are reported paper results. The public snapshot contains the framework and
 
 Use **Python 3.11**. The project pins **Flower 1.40.0** and **TorchLens 2.34.1**, and requires **PyTorch >= 2.11.0**. See [pyproject.toml](pyproject.toml) for the dependency declarations.
 
-The recommended installation uses `uv` and the repository lockfile:
+The recommended installation uses `uv` and the repository lockfile. The `experiment` extra supplies torchvision for the ResNet-50 examples below:
 
 ```bash
 git clone https://github.com/SplitFleet-sys/SplitFleet.git
 cd SplitFleet
-uv sync --python 3.11
+uv sync --python 3.11 --extra experiment
 ```
 
 The [bundled TorchLens wheel](torchlens-2.34.1-py3-none-any.whl) is selected by `tool.uv.sources` and recorded in [uv.lock](uv.lock). Keep it in place: the runtime checks the exact TorchLens version and uses its split-training API.
@@ -92,28 +82,24 @@ Optional backend dependencies can be installed with the corresponding extra:
 uv sync --python 3.11 --extra tensorflow
 ```
 
-Other extras include `paddle`, `multibackend`, `integration` for model integrations, and `simulation` for Flower/Ray dependencies. Installing the simulation extra alone does not supply the omitted experiment helpers described in [Release scope](#release-scope). GPU deployments also require backend builds appropriate to the device and CUDA environment.
+Other extras include `paddle`, `multibackend`, `integration` for model integrations, and `simulation` for Flower/Ray dependencies. GPU deployments also require backend builds appropriate to the device and CUDA environment.
 
 ## Quickstart
 
 ### Run a local split-training step
 
-Save the following as `quickstart.py`. It uses synthetic data and the public `AutoSplitSession` API to run the prefix forward pass, suffix loss and backward pass, and prefix backward pass on the CPU.
+Save the following as `quickstart.py`. It uses torchvision's ResNet-50 with a ten-class head and the public `AutoSplitSession` API to run the prefix forward pass, suffix loss and backward pass, and prefix backward pass on the CPU. Synthetic RGB images keep this API example self-contained; `weights=None` initializes the standard architecture without downloading pretrained weights.
 
 ```python
 import torch
 from torch import nn
+from torchvision.models import resnet50
 
 from splitfleet.autosplit import AutoSplitSession
 
-
-def make_model():
-    return nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
-
-
 torch.manual_seed(7)
-model = make_model().train()
-sample_inputs = torch.randn(2, 4)
+model = resnet50(weights=None, num_classes=10).train()
+sample_inputs = torch.randn(2, 3, 224, 224)
 targets = torch.tensor([0, 1])
 
 session = AutoSplitSession(device="cpu")
@@ -140,7 +126,7 @@ print(f"loss={result['loss'].detach().item():.6f}")
 ```
 
 ```bash
-uv run python quickstart.py
+uv run --extra experiment python quickstart.py
 ```
 
 This is one split-training step in a single process. A federated deployment additionally needs client data loaders, independent client/server model replicas, RPC connections, and round orchestration. The shared stateless SGD optimizer above is suitable for this local example; distributed stages and clients maintain their own optimizer state.
@@ -173,7 +159,7 @@ predicted_round_cost(i, c) = local_batches(i) * (
 
 Computation and boundary communication are charged per local batch; model-state exchange is charged once per round. Calibration measures admitted structural anchors and restores training state afterward. Successful training feedback updates each client's cost estimates; failed executions affect feasibility and cooldown without becoming latency samples. A client's chosen cut stays fixed for that local round.
 
-To configure the policy, reuse the imports, model factory, and sample batch from the quickstart with a fresh model:
+To configure the policy, reuse the imports and sample batch from the quickstart with a fresh ResNet-50 model:
 
 ```python
 from splitfleet.server.placement import (
@@ -184,7 +170,7 @@ from splitfleet.server.placement import (
 from splitfleet.server.strategy import AutoSplitStrategy
 from splitfleet.tasks import ImageClassificationTask, ModelInputs, TaskBatch
 
-model = make_model()
+model = resnet50(weights=None, num_classes=10)
 sample_batch = TaskBatch(ModelInputs.from_value(sample_inputs), targets)
 placement = GreedyPlacementPolicy(
     candidate_provider=TorchLensCandidateProvider(
@@ -226,22 +212,9 @@ The default policy configuration uses one suffix execution slot (`C=1`) while re
 | [splitfleet/split_engine/](splitfleet/split_engine) | Split-engine interfaces and graph/model contracts |
 | [splitfleet/transport/](splitfleet/transport) | Activation, gradient, and tensor-bundle wire formats |
 | [splitfleet/validation/](splitfleet/validation) | Synthetic task-equivalence CLI |
-| [splitfleet/virtual/](splitfleet/virtual) | Virtual-client runtime source; see release scope below |
+| [splitfleet/virtual/](splitfleet/virtual) | Flower/Ray virtual-client runtime source |
 | [proto/](proto) | RPC protocol definitions |
 | [dependency_patches/](dependency_patches) | Dependency patch notices and third-party license texts |
-
-## Release scope
-
-This public snapshot excludes `examples/`, `experiments/`, and `tests/`. The quickstart and validation commands above use code included in the snapshot. The historical completion report at the repository root describes development artifacts and is not an index of files available in this release.
-
-Virtual-runtime sources are present, but they currently import helpers from the omitted experiment package, including TCP pacing and Dirichlet data partitioning. The paper's virtual-client runs and high-level configuration listing therefore cannot be launched directly from this snapshot. The manuscript's listing is conceptual; use the concrete APIs shown above when integrating the public code.
-
-Additional execution constraints:
-
-- The current autosplit planner supports two stages: one client prefix and one server suffix.
-- A negotiated `dynamic_batch` range admits batch sizes only when native replay validation supports them. Use matching `batch_axes={}` settings for an explicit fixed-shape capture.
-- Training admission does not establish numerical equivalence for every model or cut. Validate outputs, losses, gradients, and optimizer updates for the workload you use. Matching full-model FedAvg additionally depends on local work, optimizer state, buffers, randomness, and numerical execution.
-- Parameters written by both stages require compatible ownership and update semantics. SplitFed rejects dual-stage tied updates by default; the explicit `tied_weight_update_mode="additive_sgd"` option is restricted to matching stateless SGD without weight decay.
 
 ## Paper and attribution
 
