@@ -1,0 +1,1145 @@
+"""TorchLens autosplit-aware strategy facade built on top of PlainSlStrategy."""
+
+from __future__ import annotations
+
+import time
+from logging import ERROR, WARNING
+from typing import Any, Dict, Mapping, Optional, Sequence
+
+import numpy as np
+from flwr.common import log, ndarrays_to_parameters, parameters_to_ndarrays
+from flwr.server.client_manager import ClientManager
+from flwr.server.strategy.aggregate import aggregate
+
+from splitfleet.autosplit import (
+    AggregationPolicy,
+    AutoSplitPlanner,
+    AutoSplitSession,
+    ExecutionSchedulePolicy,
+    PartitionSelectionPolicy,
+    PlacementConstraint,
+    PlacementObjective,
+    ReplicaScope,
+    ReplicaScopePolicy,
+    WorkerSpec,
+    normalize_batch_window,
+)
+from splitfleet.server.client_selection import (
+    ClientSelector,
+    OortSelector,
+    OortSelectorConfig,
+    RandomSelector,
+)
+from splitfleet.autosplit.planner import validate_stage_counts
+from splitfleet.autosplit.torchlens_backend import TorchLensRuntimeHandle
+from splitfleet.autosplit.torchlens_contract import runtime_contract_digest, stable_json
+from splitfleet.autosplit.state_ownership import (
+    OWNERSHIP_KEY, DIGEST_KEY, state_ownership, aggregate_owned,
+)
+from splitfleet.split_engine import graph_contract_for_runtime_handle
+from splitfleet.split_engine.contracts import ModelVersionContract
+from splitfleet.backends.utils import adapter_for, move_value
+from splitfleet.tasks import ModelInputs, TaskAdapter, TaskBatch
+from splitfleet.common.constants import (
+    AUTOSPLIT_BACKEND_CONFIG_KEY,
+    AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
+    AUTOSPLIT_FRAMEWORK_BACKEND_CONFIG_KEY,
+    AUTOSPLIT_BOUNDARY_CONFIG_KEY,
+    AUTOSPLIT_BOUNDARY_TENSOR_LABELS_CONFIG_KEY,
+    AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY,
+    AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY,
+    AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY,
+    AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY,
+    AUTOSPLIT_GRAPH_CONTRACT_CONFIG_KEY,
+    AUTOSPLIT_GRAPH_CONTRACT_DIGEST_CONFIG_KEY,
+    AUTOSPLIT_MODEL_VERSION_CONFIG_KEY,
+    AUTOSPLIT_MODEL_VERSION_CONTRACT_CONFIG_KEY,
+    AUTOSPLIT_MODE_CONFIG_KEY,
+    AUTOSPLIT_PLAN_ID_CONFIG_KEY,
+    AUTOSPLIT_SPLIT_ID_CONFIG_KEY,
+    AUTOSPLIT_STAGE_COUNT_CONFIG_KEY,
+    AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY,
+    AUTOSPLIT_RUNTIME_BACKEND_VALUE_TORCHLENS_NATIVE,
+    AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY,
+    AUTOSPLIT_RUNTIME_CONTRACT_DIGEST_CONFIG_KEY,
+    AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY,
+    AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY,
+    AUTOSPLIT_TRAINABLE_CONFIG_KEY,
+    CLIENT_ID_CONFIG_KEY,
+)
+from splitfleet.server.placement import PlacementFeedback, RoundPlacementPolicy
+from splitfleet.server.server_model.autosplit_tail_server_model import AutoSplitTailServerModel
+from splitfleet.server.strategy.plain_strategy import PlainSlStrategy
+
+
+TIED_WEIGHT_UPDATE_MODES = ("reject", "additive_sgd")
+
+
+def _coerce_replica_scope_policy(
+    replica_scope_policy: Optional[ReplicaScopePolicy | ReplicaScope | str],
+) -> ReplicaScopePolicy:
+    if replica_scope_policy is None:
+        return ReplicaScopePolicy(replica_scope=ReplicaScope.SHARED)
+    if isinstance(replica_scope_policy, ReplicaScopePolicy):
+        return replica_scope_policy
+    if isinstance(replica_scope_policy, ReplicaScope):
+        return ReplicaScopePolicy(replica_scope=replica_scope_policy)
+    normalized = replica_scope_policy.strip().lower().replace("-", "_")
+    return ReplicaScopePolicy(replica_scope=ReplicaScope(normalized))
+
+
+def _coerce_aggregation_policy(
+    aggregation_policy: Optional[AggregationPolicy | str],
+) -> AggregationPolicy:
+    if aggregation_policy is None:
+        return AggregationPolicy()
+    if isinstance(aggregation_policy, AggregationPolicy):
+        return aggregation_policy
+    return AggregationPolicy(name=aggregation_policy)
+
+
+class AutoSplitStrategy(PlainSlStrategy):
+    """Strategy that computes and propagates TorchLens split metadata."""
+
+    uses_stage_runtime = True
+
+    def __init__(
+        self,
+        *,
+        model,
+        sample_inputs,
+        sample_kwargs: Optional[Dict[str, Any]] = None,
+        batch_axes: Optional[Dict[str, int]] = None,
+        worker_specs: Optional[Sequence[WorkerSpec]] = None,
+        autosplit_session: Optional[AutoSplitSession] = None,
+        planner: Optional[AutoSplitPlanner] = None,
+        constraints: Optional[PlacementConstraint] = None,
+        objective: Optional[PlacementObjective] = None,
+        partition_selection_policy: Optional[PartitionSelectionPolicy] = None,
+        replica_scope_policy: Optional[ReplicaScopePolicy | ReplicaScope | str] = None,
+        execution_schedule_policy: Optional[ExecutionSchedulePolicy] = None,
+        aggregation_policy: Optional[AggregationPolicy | str] = None,
+        preferred_stage_count: Optional[int] = 2,
+        client_stage_count: int = 1,
+        boundary: str = "50%",
+        dynamic_batch: tuple[int, int] | list[int] | None = None,
+        trace_batch_mode: Optional[str] = None,
+        mode: str = "generated_eager",
+        task: TaskAdapter | None = None,
+        loss_fn=None,
+        optimizer_fn=None,
+        runtime_device: str = "cpu",
+        defer_server_models: bool = False,
+        placement_policy: Optional[RoundPlacementPolicy] = None,
+        tied_weight_update_mode: str = "reject",
+        owned_state_exchange: bool = False,
+        integer_aggregation_policy: str = "weighted_round",
+        client_selection: str | None = "flower_default",
+        client_selector: Optional[ClientSelector] = None,
+        oort_config: Optional[OortSelectorConfig] = None,
+        round_state_store=None,
+        **kwargs,
+    ) -> None:
+        validate_stage_counts(
+            preferred_stage_count=preferred_stage_count,
+            client_stage_count=client_stage_count,
+        )
+        self.model = model
+        if integer_aggregation_policy not in {"weighted_round", "maximum"}:
+            raise ValueError("Unknown integer state aggregation policy")
+        self.integer_aggregation_policy = integer_aggregation_policy
+        self.round_state_store = round_state_store
+        sample_call = ModelInputs.from_value(sample_inputs.inputs if isinstance(sample_inputs, TaskBatch) else sample_inputs)
+        if sample_kwargs is not None:
+            if sample_call.kwargs:
+                raise ValueError("Provide keyword samples in ModelInputs or sample_kwargs, not both.")
+            sample_call = ModelInputs(sample_call.args, sample_kwargs)
+        self.sample_inputs = sample_call.args
+        self.sample_kwargs = dict(sample_call.kwargs)
+        self._calibration_batch = sample_inputs if isinstance(sample_inputs, TaskBatch) else None
+        self.backend_adapter = adapter_for(model, sample_call.args if sample_call.args else sample_call.kwargs)
+        self.batch_axes = batch_axes
+        self.worker_specs = list(worker_specs or [WorkerSpec(worker_id="coordinator", device="cpu")])
+        self.autosplit_session = autosplit_session or AutoSplitSession(
+            planner=planner or AutoSplitPlanner()
+        )
+        self.constraints = constraints or PlacementConstraint()
+        self.objective = objective or PlacementObjective()
+        self.partition_selection_policy = partition_selection_policy or PartitionSelectionPolicy(
+            preferred_stage_count=preferred_stage_count
+        )
+        self.aggregation_policy = _coerce_aggregation_policy(aggregation_policy)
+        self.replica_scope_policy = _coerce_replica_scope_policy(replica_scope_policy)
+        if (
+            replica_scope_policy is None
+            and (
+                self.aggregation_policy.requires_per_client_replica_scope()
+                or placement_policy is not None
+            )
+        ):
+            self.replica_scope_policy = ReplicaScopePolicy(replica_scope=ReplicaScope.PER_CLIENT)
+        if (
+            self.aggregation_policy.requires_per_client_replica_scope()
+            and self.replica_scope_policy.resolve() != ReplicaScope.PER_CLIENT
+        ):
+            raise ValueError(
+                "SplitFed aggregation requires `ReplicaScope.PER_CLIENT` server replicas."
+            )
+        if (
+            placement_policy is not None
+            and self.replica_scope_policy.resolve() != ReplicaScope.PER_CLIENT
+        ):
+            raise ValueError(
+                "Per-client placement requires `ReplicaScope.PER_CLIENT` server replicas."
+            )
+        self.execution_schedule_policy = execution_schedule_policy or ExecutionSchedulePolicy()
+        self.client_stage_count = int(client_stage_count)
+        self.defer_server_models = defer_server_models
+        self.boundary = boundary
+        # The dynamic batch window is part of the feature ABI, so it is planned
+        # once here and broadcast to every device instead of being re-derived
+        # from each client's own sample batch.
+        self.dynamic_batch = normalize_batch_window(dynamic_batch)
+        self.trace_batch_mode = str(trace_batch_mode) if trace_batch_mode else None
+        self.mode = mode
+        self.task = task
+        self.loss_fn = loss_fn if loss_fn is not None else (task.loss if task is not None else None)
+        self.optimizer_fn = optimizer_fn
+        self.runtime_device = runtime_device
+        self.placement_policy = placement_policy
+        normalized_tied_mode = str(tied_weight_update_mode).strip().lower()
+        if normalized_tied_mode not in TIED_WEIGHT_UPDATE_MODES:
+            raise ValueError(
+                f"Unsupported tied_weight_update_mode {tied_weight_update_mode!r}; "
+                f"expected one of {TIED_WEIGHT_UPDATE_MODES}."
+            )
+        self.tied_weight_update_mode = normalized_tied_mode
+        self.owned_state_exchange = bool(owned_state_exchange)
+        if self.owned_state_exchange and self.replica_scope_policy.resolve() != ReplicaScope.PER_CLIENT:
+            raise ValueError("Owned state exchange requires independent per-client replicas")
+        self._round_ownership: dict[int, dict[str, dict]] = {}
+        self._placement_plan = None
+        self._placement_plans: dict[str, Any] = {}
+        self._evaluation_placement_plans: dict[str, Any] = {}
+        self._round_placement_assignments: dict[tuple[int, bool], dict[str, str]] = {}
+        self._round_fit_dispatch_start: dict[int, float] = {}
+        self._autosplit_config_cache: dict[tuple[str, bool], Dict[str, Any]] = {}
+        self._round_initial_client_states: dict[int, list[np.ndarray]] = {}
+        self._round_initial_server_states: dict[int, list[np.ndarray]] = {}
+        self._pending_client_updates: dict[
+            int, dict[str, tuple[list[np.ndarray], float]]
+        ] = {}
+        self._reassembled_client_states: dict[int, list[np.ndarray]] = {}
+        self._logical_state_names: list[str] | None = None
+        self._logical_tied_groups: tuple[tuple[int, ...], ...] | None = None
+        self._runtime_manager = None
+        self.client_selector = self._make_client_selector(
+            client_selection=client_selection,
+            client_selector=client_selector,
+            oort_config=oort_config,
+        )
+        self._last_selection_result = None
+
+        init_server_model_fn = kwargs.pop("init_server_model_fn", None) or self._make_server_model
+        super().__init__(
+            init_server_model_fn=init_server_model_fn,
+            common_server_model=not self.replica_scope_policy.requires_independent_replicas(),
+            process_clients_as_batch=self.execution_schedule_policy.should_batch(),
+            **kwargs,
+        )
+
+    @staticmethod
+    def _make_client_selector(
+        *,
+        client_selection: str | None,
+        client_selector: Optional[ClientSelector],
+        oort_config: Optional[OortSelectorConfig],
+    ) -> Optional[ClientSelector]:
+        if client_selector is not None:
+            return client_selector
+        if client_selection is None:
+            return None
+        normalized = str(client_selection).strip().lower()
+        if normalized in ("flower_default", "default"):
+            return None
+        if normalized == "oort":
+            return OortSelector(oort_config or OortSelectorConfig())
+        if normalized == "random":
+            seed = oort_config.seed if oort_config is not None else 233
+            return RandomSelector(seed=seed)
+        raise ValueError(f"Unsupported client_selection: {client_selection!r}")
+
+    def bind_stage_runtime_manager(self, runtime_manager) -> None:
+        self._runtime_manager = runtime_manager
+        if self._placement_plan is not None:
+            runtime_manager.set_placement_plan(self._placement_plan)
+        for placement in (*self._placement_plans.values(), *self._evaluation_placement_plans.values()):
+            if placement is not self._placement_plan:
+                runtime_manager.register_placement_plan(placement)
+
+    def release_placement_runtimes(self):
+        """Retain algorithm/candidate state while evicting inactive execution views."""
+        if self._runtime_manager is not None:
+            self._runtime_manager.release_placement_runtimes()
+        self._placement_plan = None
+        self._placement_plans.clear()
+        self._evaluation_placement_plans.clear()
+        self._autosplit_config_cache.clear()
+        provider = getattr(self.placement_policy, "candidate_provider", None)
+        release = getattr(provider, "release_prepared_handles", None)
+        if release is not None:
+            release()
+
+    def initialize_parameters(self, client_manager):
+        _ = client_manager
+        return ndarrays_to_parameters(
+            self.backend_adapter.export_ndarrays(self.model)
+        )
+
+    def initialize_server_parameters(self):
+        return self.backend_adapter.export_ndarrays(self.model)
+
+    def get_or_create_placement_plan(self, boundary: str | None = None, *, training: bool = True):
+        requested_boundary = str(boundary or self.boundary)
+        if boundary is None and self.placement_policy is not None and requested_boundary.endswith("%"):
+            try:
+                fraction = float(requested_boundary[:-1]) / 100.0
+            except ValueError:
+                fraction = None
+            if fraction is not None:
+                catalog = self.placement_policy.candidate_provider.get_candidates(training=True)
+                requested_boundary = min(
+                    catalog,
+                    key=lambda item: (abs(item.graph_position_ratio - fraction), item.boundary),
+                ).boundary
+                self.boundary = requested_boundary
+        placements = self._placement_plans if training else self._evaluation_placement_plans
+        placement = placements.get(requested_boundary)
+        if placement is None:
+            provider = getattr(self.placement_policy, "candidate_provider", None)
+            get_prepared_plan = getattr(provider, "get_placement_plan", None)
+            if get_prepared_plan is None:
+                reference_model = self.backend_adapter.clone_model(self.model)
+                self.backend_adapter.set_training(reference_model, training)
+                placement = self.autosplit_session.plan(
+                    reference_model,
+                    self.sample_inputs,
+                    sample_kwargs=self.sample_kwargs,
+                    batch_axes=self.batch_axes,
+                    worker_specs=self.worker_specs,
+                    constraints=self.constraints,
+                    objective=self.objective,
+                    preferred_stage_count=self.partition_selection_policy.preferred_stage_count,
+                    client_stage_count=self.client_stage_count,
+                    model_name=self.model.__class__.__name__,
+                    boundary=requested_boundary,
+                    mode=self.mode,
+                    trainable=True,
+                    dynamic_batch=self.dynamic_batch,
+                    trace_batch_mode=self.trace_batch_mode,
+                )
+            else:
+                placement = get_prepared_plan(
+                    requested_boundary,
+                    worker_specs=self.worker_specs,
+                    constraints=self.constraints,
+                    objective=self.objective,
+                    model_name=self.model.__class__.__name__,
+                    training=training,
+                )
+                if placement is None:
+                    raise RuntimeError(
+                        f"Candidate provider returned no prepared placement for {requested_boundary!r}."
+                    )
+            placement.metadata["_training"] = bool(training)
+            placements[requested_boundary] = placement
+            if self._runtime_manager is not None:
+                self._runtime_manager.register_placement_plan(placement)
+        if training and boundary is None and self._placement_plan is None:
+            self._placement_plan = placement
+            if self._runtime_manager is not None:
+                self._runtime_manager.set_placement_plan(self._placement_plan)
+        return placement
+
+    def _plan_round_placements(
+        self,
+        server_round: int,
+        client_ids: Sequence[str],
+        *,
+        training: bool,
+    ) -> dict[str, str]:
+        """Plan selected clients together and cache the only assignment for the round."""
+
+        key = (int(server_round), bool(training))
+        cached = self._round_placement_assignments.get(key)
+        normalized = tuple(str(cid) for cid in client_ids)
+        if cached is not None:
+            missing = set(normalized) - set(cached)
+            if missing:
+                raise ValueError(
+                    f"round {server_round} placement was already fixed without clients {sorted(missing)}"
+                )
+            return cached
+        if self.placement_policy is None:
+            assignments = {cid: str(self.boundary) for cid in normalized}
+        else:
+            assignments = dict(
+                self.placement_policy.plan_round(
+                    round_id=int(server_round),
+                    client_ids=normalized,
+                    training=bool(training),
+                )
+            )
+            if set(assignments) != set(normalized):
+                raise ValueError("placement policy must return exactly one boundary per selected client")
+        self._round_placement_assignments[key] = {
+            str(cid): str(boundary) for cid, boundary in assignments.items()
+        }
+        self._prune_placement_cache(int(server_round))
+        return self._round_placement_assignments[key]
+
+    def _placement_for_client(self, server_round: int, cid: str, *, training: bool):
+        if self.placement_policy is None:
+            return self.get_or_create_placement_plan(training=training)
+        assignments = self._round_placement_assignments.get((int(server_round), bool(training)))
+        if assignments is None:
+            assignments = self._plan_round_placements(
+                server_round, [str(cid)], training=training
+            )
+        try:
+            boundary = assignments[str(cid)]
+        except KeyError as exc:
+            raise ValueError(f"no round placement exists for client {cid!r}") from exc
+        return self.get_or_create_placement_plan(boundary, training=training)
+
+    def _prune_placement_cache(self, server_round: int) -> None:
+        """Keep only the current round so long runs do not accumulate entries."""
+
+        stale = [key for key in self._round_placement_assignments if key[0] < server_round]
+        for key in stale:
+            self._round_placement_assignments.pop(key, None)
+
+    def _discard_round_state(self, through: int) -> None:
+        """Drop per-round bookkeeping for every round up to and including ``through``.
+
+        A round that never reaches ``aggregate_server_fit`` (no client was
+        selected, or the round raised) would otherwise keep a full copy of the
+        client and server model for the lifetime of the run.
+        """
+
+        stores = (
+            self._round_initial_client_states,
+            self._round_initial_server_states,
+            self._pending_client_updates,
+            self._reassembled_client_states,
+            self._round_ownership,
+        )
+        for store in stores:
+            for stale in [key for key in store if key <= int(through)]:
+                store.pop(stale, None)
+
+    def _make_server_model(self):
+        if self._runtime_manager is None:
+            raise RuntimeError(
+                "AutoSplitStrategy has not been bound to a StageRuntimeManager yet."
+            )
+        return AutoSplitTailServerModel(
+            runtime_manager=self._runtime_manager,
+            model=self.model,
+            sample_inputs=self.sample_inputs if self.sample_inputs else self.sample_kwargs,
+            optimizer_fn=self.optimizer_fn,
+            loss_fn=self.loss_fn,
+            task=self.task,
+            boundary=self.boundary,
+            mode=self.mode,
+            device=self.runtime_device,
+            defer_model=self.defer_server_models,
+        )
+
+    def _autosplit_config(
+        self,
+        model_version: int = 0,
+        *,
+        training: bool = True,
+        placement=None,
+    ) -> Dict[str, Any]:
+        placement = placement or self.get_or_create_placement_plan(training=training)
+        if placement.metadata.get("_training", training) != training:
+            placement = self.get_or_create_placement_plan(placement.boundary, training=training)
+        cache_key = (placement.plan_id, bool(training))
+        base_config = self._autosplit_config_cache.get(cache_key)
+        if base_config is None:
+            reference_handle = placement.metadata.get("_runtime_handle")
+            if not isinstance(reference_handle, TorchLensRuntimeHandle):
+                raise RuntimeError(
+                    f"Placement {placement.plan_id!r} has no prepared TorchLens runtime handle."
+                )
+            if (
+                reference_handle.plan.plan_id != placement.plan_id
+                or reference_handle.plan.boundary != placement.boundary
+                or reference_handle.plan.split_id != placement.split_id
+                or reference_handle.plan.graph_signature != placement.graph_signature
+                or reference_handle.plan.feature_abi_id != placement.feature_abi_id
+            ):
+                raise RuntimeError(
+                    f"Placement {placement.plan_id!r} does not match its prepared TorchLens runtime."
+                )
+            placement.metadata["_runtime_handle"] = reference_handle
+            if self._runtime_manager is not None:
+                self._runtime_manager.bind_runtime_handle(reference_handle, plan_id=placement.plan_id, make_default=False)
+            contract = graph_contract_for_runtime_handle(reference_handle)
+            state_schema_hash = self.backend_adapter.state_manifest(self.model).schema_hash
+            base_config = {
+                AUTOSPLIT_BACKEND_CONFIG_KEY: AUTOSPLIT_BACKEND_VALUE_TORCHLENS,
+                AUTOSPLIT_FRAMEWORK_BACKEND_CONFIG_KEY: self.backend_adapter.backend_name,
+                AUTOSPLIT_RUNTIME_BACKEND_CONFIG_KEY: AUTOSPLIT_RUNTIME_BACKEND_VALUE_TORCHLENS_NATIVE,
+                AUTOSPLIT_TORCHLENS_VERSION_CONFIG_KEY: placement.torchlens_version,
+                AUTOSPLIT_PLAN_ID_CONFIG_KEY: placement.plan_id,
+                AUTOSPLIT_SPLIT_ID_CONFIG_KEY: reference_handle.plan.split_id,
+                AUTOSPLIT_GRAPH_SIGNATURE_CONFIG_KEY: reference_handle.plan.graph_signature,
+                AUTOSPLIT_BOUNDARY_CONFIG_KEY: placement.boundary,
+                AUTOSPLIT_BOUNDARY_TENSOR_LABELS_CONFIG_KEY: stable_json(placement.boundary_tensor_labels),
+                AUTOSPLIT_MODE_CONFIG_KEY: placement.mode,
+                AUTOSPLIT_STAGE_COUNT_CONFIG_KEY: 2,
+                AUTOSPLIT_CLIENT_STAGE_COUNT_CONFIG_KEY: 1,
+                AUTOSPLIT_FEATURE_ABI_ID_CONFIG_KEY: placement.feature_abi_id,
+                AUTOSPLIT_RUNTIME_CONTRACT_CONFIG_KEY: stable_json(placement.runtime_contract),
+                AUTOSPLIT_RUNTIME_CONTRACT_DIGEST_CONFIG_KEY: runtime_contract_digest(placement.runtime_contract),
+                AUTOSPLIT_TRACE_BATCH_MODE_CONFIG_KEY: placement.trace_batch_mode,
+                AUTOSPLIT_TRAINABLE_CONFIG_KEY: reference_handle.plan.trainable,
+                AUTOSPLIT_DYNAMIC_BATCH_CONFIG_KEY: stable_json(placement.dynamic_batch),
+                AUTOSPLIT_GRAPH_CONTRACT_CONFIG_KEY: contract.to_json().decode("utf-8"),
+                AUTOSPLIT_GRAPH_CONTRACT_DIGEST_CONFIG_KEY: contract.digest,
+                "_state_schema_hash": state_schema_hash,
+            }
+            if self.owned_state_exchange and training:
+                base_config[OWNERSHIP_KEY] = stable_json(state_ownership(reference_handle, state_schema_hash))
+            self._autosplit_config_cache[cache_key] = base_config
+        state_schema_hash = str(base_config["_state_schema_hash"])
+        version_contract = ModelVersionContract(
+            round_model_version=int(model_version),
+            prefix_state_version=int(model_version),
+            suffix_state_version=int(model_version),
+            state_schema_hash=state_schema_hash,
+        )
+        config = {
+            key: value for key, value in base_config.items() if not key.startswith("_")
+        }
+        config.update({
+            AUTOSPLIT_MODEL_VERSION_CONFIG_KEY: int(model_version),
+            AUTOSPLIT_MODEL_VERSION_CONTRACT_CONFIG_KEY: version_contract.to_json().decode("utf-8"),
+        })
+        return config
+
+    def configure_fit(self, server_round, parameters, client_manager):
+        self._discard_round_state(int(server_round) - 1)
+        initial = parameters_to_ndarrays(parameters)
+        self._round_initial_client_states[int(server_round)] = initial if self.owned_state_exchange else [
+            np.array(value, copy=True) for value in initial
+        ]
+        instructions = super().configure_fit(server_round, parameters, client_manager)
+        if hasattr(self.placement_policy, "state_download_bytes"):
+            self.placement_policy.state_download_bytes = sum(len(value) for value in parameters.tensors)
+        prepare_calibration = getattr(self.placement_policy, "prepare_calibration", None)
+        # Physical SplitFleet prepares the state-preserving calibration once
+        # before Flower starts.  Some callers construct the strategy with raw
+        # ModelInputs rather than a TaskBatch, so there is no representative
+        # target available here; avoid a second, target-less calibration call.
+        if (prepare_calibration is not None and self._calibration_batch is not None
+                and self.backend_adapter.backend_name in {'torch', 'tf', 'paddle'}
+                and hasattr(self.placement_policy.candidate_provider, "model")):
+            prepare_calibration(
+                ModelInputs(self.sample_inputs, self.sample_kwargs),
+                move_value(self._calibration_batch.targets, self.backend_adapter, self.runtime_device)
+                if self._calibration_batch is not None else None,
+                loss_fn=self.loss_fn, device=self.runtime_device,
+                parameters=initial,
+                optimizer_fn=self.optimizer_fn,
+            )
+        bind_clients = getattr(self.placement_policy, "bind_clients", None)
+        if bind_clients is not None:
+            bind_clients([client for client, _ in instructions], server_round)
+        self._plan_round_placements(
+            server_round,
+            [client.cid for client, _ in instructions],
+            training=True,
+        )
+        for client, fit_ins in instructions:
+            placement = self._placement_for_client(server_round, client.cid, training=True)
+            fit_ins.config[CLIENT_ID_CONFIG_KEY] = str(client.cid)
+            fit_ins.config.update(
+                self._autosplit_config(server_round, training=True, placement=placement)
+            )
+            if self.owned_state_exchange:
+                import json
+                self._round_ownership.setdefault(int(server_round), {})[str(client.cid)] = json.loads(
+                    fit_ins.config[OWNERSHIP_KEY])
+        self._round_fit_dispatch_start[int(server_round)] = time.perf_counter()
+        if hasattr(self.placement_policy, "state_download_bytes"):
+            from splitfleet.server.placement.greedy.rpc_timing import TimedFitClientProxy
+            instructions = [(TimedFitClientProxy(client), ins) for client, ins in instructions]
+        return instructions
+
+    def select_fit_clients(
+        self,
+        *,
+        server_round: int,
+        client_manager: ClientManager,
+        sample_size: int,
+        min_num_clients: int,
+    ):
+        if self.client_selector is None:
+            return super().select_fit_clients(
+                server_round=server_round,
+                client_manager=client_manager,
+                sample_size=sample_size,
+                min_num_clients=min_num_clients,
+            )
+
+        try:
+            available_clients = client_manager.all()
+        except (AttributeError, NotImplementedError):
+            return super().select_fit_clients(
+                server_round=server_round,
+                client_manager=client_manager,
+                sample_size=sample_size,
+                min_num_clients=min_num_clients,
+            )
+        client_map = self._normalize_client_map(available_clients)
+        candidate_cids = list(client_map)
+        if len(candidate_cids) < min_num_clients:
+            return super().select_fit_clients(
+                server_round=server_round,
+                client_manager=client_manager,
+                sample_size=sample_size,
+                min_num_clients=min_num_clients,
+            )
+
+        result = self.client_selector.select(
+            round_id=server_round,
+            candidate_cids=candidate_cids,
+            num_clients=sample_size,
+        )
+        self._last_selection_result = result
+        clients = [
+            client_map[cid]
+            for cid in result.selected_cids
+            if cid in client_map
+        ]
+        self._round_active_clients = [client.cid for client in clients]
+        return clients
+
+    @staticmethod
+    def _normalize_client_map(available_clients):
+        if isinstance(available_clients, dict):
+            return {str(cid): client for cid, client in available_clients.items()}
+        return {
+            str(client.cid): client
+            for client in available_clients
+            if hasattr(client, "cid")
+        }
+
+    def configure_evaluate(self, server_round, parameters, client_manager):
+        instructions = super().configure_evaluate(server_round, parameters, client_manager)
+        bind_clients = getattr(self.placement_policy, "bind_evaluation_clients", None)
+        if bind_clients is not None:
+            bind_clients([client for client, _ in instructions], server_round)
+        self._plan_round_placements(
+            server_round,
+            [client.cid for client, _ in instructions],
+            training=False,
+        )
+        for client, evaluate_ins in instructions:
+            placement = self._placement_for_client(server_round, client.cid, training=False)
+            evaluate_ins.config[CLIENT_ID_CONFIG_KEY] = str(client.cid)
+            evaluate_ins.config.update(
+                self._autosplit_config(server_round, training=False, placement=placement)
+            )
+        return instructions
+
+    def configure_server_fit(self, server_round, parameters, cids):
+        if self.owned_state_exchange:
+            parameters = self._round_initial_client_states[int(server_round)]
+        self._round_initial_server_states[int(server_round)] = parameters if self.owned_state_exchange else [
+            np.array(value, copy=True) for value in parameters
+        ]
+        self._plan_round_placements(server_round, cids, training=True)
+        server_configs = super().configure_server_fit(server_round, parameters, cids)
+        for config in server_configs:
+            config.config["sid"] = config.sid
+            cid = config.sid or cids[0]
+            placement = self._placement_for_client(server_round, cid, training=True)
+            config.config.update(
+                self._autosplit_config(server_round, training=True, placement=placement)
+            )
+        return server_configs
+
+    def configure_server_evaluate(self, server_round, parameters, cids):
+        self._plan_round_placements(server_round, cids, training=False)
+        server_configs = super().configure_server_evaluate(server_round, parameters, cids)
+        for config in server_configs:
+            config.config["sid"] = config.sid
+            cid = config.sid or cids[0]
+            placement = self._placement_for_client(server_round, cid, training=False)
+            config.config.update(
+                self._autosplit_config(server_round, training=False, placement=placement)
+            )
+        return server_configs
+
+    def aggregate_evaluate(self, server_round, results, failures):
+        aggregated = super().aggregate_evaluate(server_round, results, failures)
+        observe_evaluation = getattr(self.placement_policy, "observe_evaluation", None)
+        if observe_evaluation is not None:
+            planned = self._round_placement_assignments.get((int(server_round), False), {})
+            observe_evaluation(
+                round_id=int(server_round),
+                executions={
+                    str(proxy.cid): str((res.metrics or {}).get("boundary") or planned[str(proxy.cid)])
+                    for proxy, res in results
+                },
+            )
+        return aggregated
+
+    def aggregate_fit(self, server_round, results, failures):
+        dispatch_start = self._round_fit_dispatch_start.pop(int(server_round), None)
+        round_wall_ms = (
+            (time.perf_counter() - dispatch_start) * 1000.0
+            if dispatch_start is not None else None
+        )
+        usable_results = [
+            (client, fit_res)
+            for client, fit_res in results
+            if int(fit_res.num_examples) > 0
+        ]
+        ignored_zero_example_results = len(results) - len(usable_results)
+        if ignored_zero_example_results:
+            log(
+                WARNING,
+                "Ignoring %d zero-example client update(s) in round %d.",
+                ignored_zero_example_results,
+                int(server_round),
+            )
+        results = usable_results
+        if self.client_selector is not None:
+            self._update_client_selector_after_fit(server_round, results, failures)
+        self._update_placement_policy_after_fit(server_round, results, failures)
+        observe_wall_time = getattr(self.placement_policy, "observe_round_wall_time", None)
+        if observe_wall_time is not None and round_wall_ms is not None:
+            observe_wall_time(round_id=int(server_round), duration_ms=round_wall_ms)
+        self.requests_state = {}
+        self._round_active_clients = []
+        for failure in failures:
+            log(ERROR, str(failure))
+
+        per_client = self.replica_scope_policy.resolve() == ReplicaScope.PER_CLIENT
+        if not results:
+            # Every selected client failed. Record the empty round so the
+            # suffix replicas this round already created are discarded instead
+            # of being mistaken for an out-of-order aggregation call.
+            if per_client:
+                self._pending_client_updates[int(server_round)] = {}
+            return None, {}
+
+        weights = self.aggregation_policy.reduce_weights(
+            fit_res.num_examples for _, fit_res in results
+        )
+        aggregated_metrics = {}
+        if self.fit_metrics_aggregation_fn is not None:
+            fit_metrics = [(res.num_examples, res.metrics) for _, res in results]
+            aggregated_metrics = self.fit_metrics_aggregation_fn(fit_metrics)
+
+        if per_client:
+            # Each client update holds a fresh prefix and a suffix that is one
+            # round stale, so there is no valid client-side global model until
+            # `aggregate_server_fit` supplies the matching suffix halves.
+            # `finalize_round` returns the reassembled model; returning it here
+            # would mean publishing a half-stale one.
+            if self.owned_state_exchange:
+                for client, fit_res in results:
+                    manifest = self._round_ownership[int(server_round)][str(client.cid)]
+                    if fit_res.metrics.get(DIGEST_KEY) != manifest[DIGEST_KEY]:
+                        raise RuntimeError("Prefix state ownership digest mismatch")
+            self._pending_client_updates[int(server_round)] = {
+                str(getattr(client, "cid")): (
+                    (self.round_state_store.put(parameters_to_ndarrays(fit_res.parameters))
+                     if self.round_state_store is not None else parameters_to_ndarrays(fit_res.parameters)),
+                    float(weight),
+                )
+                for (client, fit_res), weight in zip(results, weights)
+            }
+            return None, aggregated_metrics
+
+        weights_results = [
+            (parameters_to_ndarrays(fit_res.parameters), weight)
+            for (_, fit_res), weight in zip(results, weights)
+        ]
+        return ndarrays_to_parameters(aggregate(weights_results)), aggregated_metrics
+
+    def _update_placement_policy_after_fit(self, server_round, results, failures) -> None:
+        """Feed round outcomes back into a stateful placement policy, if any."""
+
+        policy = self.placement_policy
+        observe_round = getattr(policy, "observe_round", None)
+        observe_failure = getattr(policy, "observe_failure", None)
+        if observe_round is None and observe_failure is None:
+            return
+        if observe_round is not None:
+            from splitfleet.server.placement.greedy.rpc_timing import state_exchange_duration
+            observations = []
+            for client, fit_res in results:
+                cid = getattr(client, "cid", None)
+                if cid is None:
+                    continue
+                metrics = dict(fit_res.metrics or {})
+                boundary = str(
+                    metrics.get("boundary")
+                    or self._round_placement_assignments.get((int(server_round), True), {}).get(str(cid), "")
+                )
+                completion_ms = self._optional_metric(metrics, "coordinator_fit_rpc_ms")
+                completion_scope = "coordinator_fit_rpc"
+                if completion_ms is None:
+                    completion_ms = self._optional_metric(metrics, "fit_duration_ms")
+                    completion_scope = "client_fit"
+                service_component = ("server_resource_service" if
+                    getattr(getattr(policy, "config", None), "closed_loop_queue", False) else "server_service")
+                service_ms = self._batch_cost_metric(metrics, service_component)
+                if service_component == "server_resource_service" and service_ms is None:
+                    raise ValueError("Closed-queue placement requires measured queue-free server spans")
+                network_ms = self._batch_cost_metric(metrics, "network_roundtrip")
+                if service_component == "server_resource_service":
+                    count = int(metrics.get("num_batches", 0))
+                    encode = self._optional_metric(metrics, "boundary_serialize_sec")
+                    decode = self._optional_metric(metrics, "gradient_deserialize_sec")
+                    if count < 1 or network_ms is None or encode is None or decode is None:
+                        raise ValueError("Closed-queue placement requires actual transport and codec timings")
+                    network_ms += (encode + decode) * 1000. / count
+                exchange_ms = state_exchange_duration(metrics)
+                observations.append(PlacementFeedback(
+                    round_id=int(server_round),
+                    client_id=str(cid),
+                    boundary=boundary,
+                    client_forward_ms=self._batch_cost_metric(metrics, "client_forward"),
+                    client_backward_ms=self._batch_cost_metric(metrics, "client_backward"),
+                    network_upload_ms=self._batch_cost_metric(metrics, "network_upload"),
+                    network_download_ms=self._batch_cost_metric(metrics, "network_download"),
+                    network_roundtrip_ms=network_ms,
+                    state_exchange_ms=exchange_ms,
+                    server_service_ms=service_ms,
+                    switch_ms=self._optional_metric(metrics, "switch_ms"),
+                    completion_ms=completion_ms,
+                    completion_scope=completion_scope,
+                    num_examples=fit_res.num_examples,
+                    num_batches=int(metrics.get("num_batches", 0)),
+                    transport_upload_bytes=(
+                        (float(metrics["activation_upload_bytes"]) + float(metrics["target_upload_bytes"])
+                         + float(metrics["request_metadata_upload_bytes"])) / int(metrics["num_batches"])
+                        if int(metrics.get("num_batches", 0)) > 0 and all(key in metrics for key in
+                            ("activation_upload_bytes", "target_upload_bytes", "request_metadata_upload_bytes")) else None),
+                    transport_download_bytes=(float(metrics["download_bytes"]) / int(metrics["num_batches"])
+                        if int(metrics.get("num_batches", 0)) > 0 and "download_bytes" in metrics else None),
+                    transport_request_overhead_bytes=(
+                        (float(metrics["target_upload_bytes"]) + float(metrics["request_metadata_upload_bytes"]))
+                        / int(metrics["num_batches"])
+                        if int(metrics.get("num_batches", 0)) > 0 and all(key in metrics for key in
+                            ("target_upload_bytes", "request_metadata_upload_bytes")) else None),
+                    transport_response_overhead_bytes=(float(metrics["response_metadata_download_bytes"])
+                        / int(metrics["num_batches"])
+                        if int(metrics.get("num_batches", 0)) > 0 and "response_metadata_download_bytes" in metrics else None),
+                    client_peak_memory_mb=self._optional_metric(metrics, "client_peak_memory_mb"),
+                    server_peak_memory_mb=self._optional_metric(metrics, "server_peak_memory_mb"),
+                    server_load=(
+                        {key.removeprefix("server_load_"): float(value)
+                         for key, value in metrics.items() if key.startswith("server_load_")}
+                        or None
+                    ),
+                    execution_profile=(
+                        {
+                            "framework_backend": str(metrics["framework_backend"]),
+                            "runtime_backend": str(metrics["runtime_backend"]),
+                            "device_type": str(metrics.get("device_type", "cpu")),
+                            "accelerator": str(metrics.get("accelerator", "generic_cpu")),
+                            "precision": str(metrics.get("precision", "fp32")),
+                        }
+                        if "framework_backend" in metrics and "runtime_backend" in metrics
+                        else None
+                    ),
+                    success=True,
+                ))
+            observe_round(round_id=int(server_round), feedback=observations)
+        if observe_failure is not None:
+            for failure in failures:
+                cid = self._failure_cid(failure)
+                if cid is None:
+                    continue
+                boundary = self._round_placement_assignments.get(
+                    (int(server_round), True), {}
+                ).get(cid)
+                observe_failure(
+                    round_id=int(server_round),
+                    client_id=cid,
+                    boundary=boundary,
+                    kind=self._classify_placement_failure(failure),
+                    reason=failure,
+                )
+
+    @classmethod
+    def _batch_cost_metric(cls, metrics: Mapping[str, Any], component: str) -> float | None:
+        """Forecast repeated work from the batch mean; retain legacy fallback.
+
+        The short ``*_ms`` fields can be batch medians. Multiplying a median
+        by the batch count understates work when concurrent steps have tails.
+        """
+        mean = cls._optional_metric(metrics, component + "_mean_ms")
+        return mean if mean is not None else cls._optional_metric(metrics, component + "_ms")
+
+    @staticmethod
+    def _optional_metric(metrics: Mapping[str, Any], key: str) -> float | None:
+        value = metrics.get(key)
+        if value is None:
+            return None
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if np.isfinite(result) and result >= 0 else None
+
+    @staticmethod
+    def _classify_placement_failure(failure: Any) -> str:
+        text = str(failure).lower()
+        if "out of memory" in text or "oom" in text:
+            return "oom"
+        if "abi" in text or "contract" in text:
+            return "abi"
+        if "timeout" in text:
+            return "network"
+        return "runtime"
+
+    def _update_client_selector_after_fit(self, server_round, results, failures) -> None:
+        for client, fit_res in results:
+            cid = getattr(client, "cid", None)
+            if cid is None:
+                continue
+            metrics = dict(fit_res.metrics or {})
+            metrics.setdefault("num_examples", fit_res.num_examples)
+            self.client_selector.update_after_fit(
+                round_id=server_round,
+                cid=str(cid),
+                num_examples=fit_res.num_examples,
+                metrics=metrics,
+            )
+        for failure in failures:
+            cid = self._failure_cid(failure)
+            if cid is None:
+                continue
+            self.client_selector.update_after_failure(
+                round_id=server_round,
+                cid=cid,
+                reason=failure,
+            )
+
+    def finalize_round(self, server_round, client_parameters, server_parameters):
+        """Publish the reassembled logical model as this round's client model.
+
+        Under `ReplicaScope.PER_CLIENT` the prefix and suffix halves of a round
+        are aggregated by two different calls, so `aggregate_fit` returns `None`
+        and the complete model is produced here. A round without a reassembled
+        model keeps the previous global parameters rather than publishing a
+        half-stale one.
+        """
+
+        reassembled = self._reassembled_client_states.pop(int(server_round), None)
+        if reassembled is None:
+            return client_parameters, server_parameters
+        return ndarrays_to_parameters(reassembled), server_parameters
+
+    def _logical_state_name_list(self) -> list[str]:
+        """The state-dict names of the logical model, in manifest order."""
+
+        if self._logical_state_names is None:
+            manifest = self.backend_adapter.state_manifest(self.model)
+            self._logical_state_names = [entry.name for entry in manifest.entries]
+        return self._logical_state_names
+
+    def _tied_state_groups(self) -> tuple[tuple[int, ...], ...]:
+        if self._logical_tied_groups is None:
+            self._logical_tied_groups = tuple(
+                tuple(int(index) for index in group)
+                for group in self.backend_adapter.tied_state_groups(self.model)
+            )
+        return self._logical_tied_groups
+
+    @staticmethod
+    def _failure_cid(failure) -> str | None:
+        if isinstance(failure, tuple) and failure:
+            cid = getattr(failure[0], "cid", None)
+            return str(cid) if cid is not None else None
+        for attr in ("cid", "client_id"):
+            cid = getattr(failure, attr, None)
+            if cid is not None:
+                return str(cid)
+        return None
+
+    def aggregate_server_fit(self, server_round, results):
+        per_client = self.replica_scope_policy.resolve() == ReplicaScope.PER_CLIENT
+        if not results:
+            if per_client and self._pending_client_updates.get(int(server_round)):
+                log(
+                    ERROR,
+                    "Round %d has client updates but no suffix result; the logical "
+                    "model cannot be reassembled and the round is skipped.",
+                    int(server_round),
+                )
+            self._discard_round_state(int(server_round))
+            return None
+        if per_client:
+            round_id = int(server_round)
+            client_updates = self._pending_client_updates.pop(round_id, None)
+            initial_client = self._round_initial_client_states.pop(round_id, None)
+            initial_server = self._round_initial_server_states.pop(round_id, None)
+            if client_updates is None:
+                raise RuntimeError(
+                    "Per-client suffix aggregation requires matching client updates first."
+                )
+            if not client_updates:
+                # `aggregate_fit` saw no successful client, so these suffix
+                # replicas have no prefix half to be reassembled with.
+                log(
+                    ERROR,
+                    "Round %d produced %d suffix result(s) but no client update; "
+                    "keeping the previous global parameters.",
+                    round_id,
+                    len(results),
+                )
+                return None
+            if initial_client is None or initial_server is None:
+                raise RuntimeError("Round initial state is unavailable for logical model reassembly.")
+            server_updates = {str(res.sid): res for res in results if res.sid is not None}
+            if self.owned_state_exchange:
+                manifests = self._round_ownership.pop(round_id)
+                owned_updates = []
+                for cid, (prefix, weight) in client_updates.items():
+                    suffix = server_updates.get(cid)
+                    if suffix is None:
+                        log(ERROR, "Dropping prefix update without matching suffix: %s", cid)
+                        continue
+                    manifest = manifests[cid]
+                    if suffix.config.get(DIGEST_KEY) != manifest[DIGEST_KEY]:
+                        raise RuntimeError("Suffix state ownership digest mismatch")
+                    owned_updates.append((manifest, prefix, suffix.parameters, weight))
+                aggregated = aggregate_owned(initial_client, owned_updates,
+                                             integer_policy=self.integer_aggregation_policy)
+                self._reassembled_client_states[round_id] = aggregated
+                return aggregated
+            names = self._logical_state_name_list()
+            tied_groups = self._tied_state_groups()
+            logical_updates = []
+            missing_suffix_cids = []
+            for cid, (client_state, weight) in client_updates.items():
+                server_result = server_updates.get(cid)
+                if server_result is None:
+                    # One device losing its suffix replica must not discard the
+                    # rounds every other device just finished.
+                    missing_suffix_cids.append(cid)
+                    continue
+                logical_updates.append(
+                    (
+                        _reassemble_named_state(
+                            names,
+                            initial_client,
+                            initial_server,
+                            client_state,
+                            server_result.parameters,
+                            tied_groups=tied_groups,
+                            tied_weight_update_mode=self.tied_weight_update_mode,
+                        ),
+                        weight,
+                    )
+                )
+            if missing_suffix_cids:
+                log(
+                    ERROR,
+                    "Dropping %d client update(s) without a matching per-client suffix "
+                    "result in round %d: %s",
+                    len(missing_suffix_cids),
+                    int(server_round),
+                    sorted(missing_suffix_cids),
+                )
+            if not logical_updates:
+                raise RuntimeError(
+                    "No client update had a matching per-client suffix result."
+                )
+            aggregated = aggregate(logical_updates)
+            # The same logical model is both halves of the split: `finalize_round`
+            # hands it back as the client-side global model for this round.
+            self._reassembled_client_states[round_id] = aggregated
+            return aggregated
+        self._discard_round_state(int(server_round))
+        weights = self.aggregation_policy.reduce_weights(
+            res.config.get("num_examples", 1) for res in results
+        )
+        return aggregate(
+            [
+                (res.parameters, weight)
+                for res, weight in zip(results, weights)
+            ]
+        )
+
+
+def _reassemble_named_state(
+    names: Sequence[str],
+    initial_client: Sequence[np.ndarray],
+    initial_server: Sequence[np.ndarray],
+    client_state: Sequence[np.ndarray],
+    server_state: Sequence[np.ndarray],
+    *,
+    tied_groups: Sequence[Sequence[int]] = (),
+    tied_weight_update_mode: str = "reject",
+) -> list[np.ndarray]:
+    lengths = {
+        len(names), len(initial_client), len(initial_server), len(client_state), len(server_state)
+    }
+    if len(lengths) != 1:
+        raise RuntimeError("Logical model state schemas differ during per-client reassembly.")
+    tied_positions = {int(index) for group in tied_groups for index in group}
+    merged = []
+    for position, (name, client_initial, server_initial, client_value, server_value) in enumerate(
+        zip(names, initial_client, initial_server, client_state, server_state)
+    ):
+        if not np.array_equal(client_initial, server_initial):
+            raise RuntimeError(f"Client/server initial state diverged for parameter {name!r}.")
+        client_changed = not np.array_equal(client_value, client_initial)
+        server_changed = not np.array_equal(server_value, server_initial)
+        if position in tied_positions:
+            if client_changed and server_changed:
+                if tied_weight_update_mode != "additive_sgd":
+                    raise RuntimeError(
+                        f"Tied parameter {name!r} changed on both split stages. "
+                        "Set tied_weight_update_mode='additive_sgd' only when both "
+                        "stages use identical stateless SGD without weight decay."
+                    )
+                # For identical stateless SGD, both stages evaluated their
+                # gradients from the same initial tensor and the logical update
+                # is exactly the sum of the two deltas.
+                merged.append(
+                    np.asarray(client_initial)
+                    + (np.asarray(client_value) - np.asarray(client_initial))
+                    + (np.asarray(server_value) - np.asarray(server_initial))
+                )
+            elif server_changed:
+                merged.append(np.array(server_value, copy=True))
+            elif client_changed:
+                merged.append(np.array(client_value, copy=True))
+            else:
+                merged.append(np.array(client_initial, copy=True))
+            continue
+        if client_changed and server_changed and not np.array_equal(client_value, server_value):
+            raise RuntimeError(
+                f"Both prefix and suffix changed parameter {name!r}; ownership is ambiguous."
+            )
+        if server_changed:
+            merged.append(np.array(server_value, copy=True))
+        elif client_changed:
+            merged.append(np.array(client_value, copy=True))
+        else:
+            merged.append(np.array(client_initial, copy=True))
+    return merged

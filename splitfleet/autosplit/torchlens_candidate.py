@@ -1,0 +1,271 @@
+"""TorchLens split candidate descriptors."""
+
+from __future__ import annotations
+
+import math
+import re
+from collections.abc import Iterable, Mapping
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+import numpy as np
+from torchlens.split.shape_program import ShapeBinding
+
+
+@dataclass(frozen=True)
+class SplitCandidate:
+    candidate_id: str
+    split_label: str
+    boundary: str
+    boundary_tensor_labels: list[str]
+    boundary_count: int
+    estimated_payload_bytes: int
+    layer_index: int | None = None
+    node_index: int | None = None
+    edge_parameter_count: int = 0
+    suffix_parameter_count: int = 0
+    total_parameter_count: int = 0
+    layer_freezing_ratio: float = 0.0
+    privacy_leakage: float = 0.0
+    is_trainable_tail: bool = True
+    graph_signature: str = ""
+    trace_batch_mode: str = "batch_gt1"
+    dynamic_batch: tuple[int, int] | None = None
+    descriptor: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def payload_bytes_from_plan(
+    runtime: Any, plan: Any, *, batch_size: int | None = None,
+    excluded_labels: Iterable[str] = (),
+) -> int:
+    """Count boundary tensor bytes at the native capture batch.
+
+    ABI shapes collapse expressions such as ``B * 10`` to ``B``. The shape
+    program retains those expressions, and boundary bindings resolve container
+    keys to the graph values used by that program. Exclusions are reserved for
+    callers that have separately audited the corresponding boundary contract.
+    """
+    program = runtime.trace_graph.shape_program
+    if program is None:
+        raise RuntimeError("TorchLens payload estimation requires a captured shape program.")
+    resolved_batch = program.traced_batch_size if batch_size is None else int(batch_size)
+    if resolved_batch < 1:
+        raise ValueError("Payload batch size must be positive")
+    excluded = set(excluded_labels)
+    if not excluded.issubset(plan.boundary_spec):
+        raise ValueError("Excluded payload labels are absent from the native boundary")
+    if batch_size is not None:
+        program.require_batch_resolvable(resolved_batch, set(plan.boundary_bindings.values()),
+            backend="torchlens_native", split_point=f"{plan.boundary_kind}:{plan.target_node_id}")
+    binding = ShapeBinding({program.batch_symbol: resolved_batch}, {})
+    total = 0
+    for label, spec in plan.boundary_spec.items():
+        if label in excluded:
+            continue
+        shape = program.value_shapes[plan.boundary_bindings[label]].evaluate(binding)
+        dtype_name = str(spec.dtype).rsplit(".", 1)[-1]
+        match = re.fullmatch(r"<dtype: '([^']+)'>", dtype_name)
+        if match:
+            dtype_name = match.group(1)
+        itemsize = 2 if dtype_name == "bfloat16" else np.dtype(dtype_name).itemsize
+        total += math.prod(shape) * itemsize
+    return total
+
+
+def boundary_schema_summary(specs: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    summary: dict[str, dict[str, Any]] = {}
+    for label, spec in specs.items():
+        summary[str(label)] = {
+            "canonical_id": spec.value_id,
+            "torchlens_label": spec.label,
+            "module_path": spec.module_path or "",
+            "op_type": spec.op_type,
+            "symbolic_shape": [str(dim) for dim in spec.shape],
+            "dtype": str(spec.dtype),
+            "requires_grad": bool(spec.requires_grad),
+            "role": spec.role,
+            "output_index": spec.output_index,
+            "device_policy": spec.device_policy,
+        }
+    return summary
+
+
+def feature_layout_from_specs(specs: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    layout: dict[str, dict[str, Any]] = {}
+    for label, spec in specs.items():
+        shape = list(spec.shape)
+        layout[str(label)] = {
+            "dtype": str(spec.dtype),
+            "shape_without_batch": [str(dim) for dim in shape[1:]],
+            "rank": len(shape),
+            "requires_grad": bool(spec.requires_grad),
+            "device_policy": spec.device_policy,
+        }
+    return layout
+
+
+def _reference_identities(value):
+    from splitfleet.autosplit.state_ownership import _native_identities
+
+    return _native_identities(value)
+
+
+def _declared_buffer_identities(runtime):
+    """Count declared BN buffers as state storage rather than model parameters."""
+    declaration = getattr(getattr(runtime, "model", None), "state_associations", None)
+    if not callable(declaration):
+        return set()
+    from splitfleet.backends import BACKEND_ADAPTERS
+
+    adapter = BACKEND_ADAPTERS.create(str(runtime.adapter.name))
+    state = (runtime.model.state_dict(keep_vars=True) if adapter.backend_name == "torch"
+             else adapter._state(runtime.model))
+    names = declaration()
+    if not set(names).issubset(state):
+        raise ValueError("Declared buffer associations do not match native model state")
+    return set().union(*(_reference_identities(state[name]) for name in names)) if names else set()
+
+
+@dataclass
+class ParameterCountIndex:
+    """Reuse captured parameter identities and sizes across candidate cuts."""
+
+    by_node: dict[str, tuple[tuple[int, int, bool], ...]]
+    total_count: int
+
+    @classmethod
+    def from_runtime(cls, runtime: Any) -> ParameterCountIndex:
+        by_node: dict[str, tuple[tuple[int, int, bool], ...]] = {}
+        all_parameters: dict[int, int] = {}
+        buffer_identities = _declared_buffer_identities(runtime)
+        for node in runtime.trace_graph.nodes:
+            entries: list[tuple[int, int, bool]] = []
+            for parameter in node.param_refs:
+                if buffer_identities & _reference_identities(parameter):
+                    continue
+                value = parameter.handle
+                identity = id(value) if value is not None else hash((parameter.address, parameter.shape))
+                size = math.prod(value.shape if value is not None else parameter.shape)
+                entries.append((identity, size, bool(parameter.is_trainable)))
+                all_parameters.setdefault(identity, size)
+            by_node[node.canonical_id] = tuple(entries)
+        return cls(by_node=by_node, total_count=sum(all_parameters.values()))
+
+    def count(self, node_names: Iterable[str], *, trainable_only: bool = False) -> int:
+        seen: set[int] = set()
+        total = 0
+        for node_name in node_names:
+            for identity, size, trainable in self.by_node.get(node_name, ()):
+                if (not trainable_only or trainable) and identity not in seen:
+                    seen.add(identity)
+                    total += size
+        return total
+
+
+@dataclass
+class ParameterByteIndex:
+    """Dtype-aware trainable storage sizes, without preparing executable cuts."""
+
+    by_node: dict[str, tuple[tuple[int, int | None, bool], ...]]
+
+    @classmethod
+    def from_runtime(cls, runtime: Any) -> ParameterByteIndex:
+        by_node = {}
+        buffer_identities = _declared_buffer_identities(runtime)
+        for node in runtime.trace_graph.nodes:
+            entries = []
+            for parameter in node.param_refs:
+                if buffer_identities & _reference_identities(parameter):
+                    continue
+                value = parameter.handle
+                identity = id(value) if value is not None else hash((parameter.address, parameter.shape))
+                size = (int(value.numel()) * int(value.element_size())
+                        if value is not None and callable(getattr(value, "element_size", None)) else None)
+                entries.append((identity, size, bool(parameter.is_trainable)))
+            by_node[node.canonical_id] = tuple(entries)
+        return cls(by_node)
+
+    def count(self, node_names: Iterable[str]) -> int | None:
+        seen, total = set(), 0
+        for name in node_names:
+            for identity, size, trainable in self.by_node.get(name, ()):
+                if not trainable or identity in seen:
+                    continue
+                if size is None:
+                    return None
+                seen.add(identity)
+                total += size
+        return total
+
+
+def candidate_from_plan(
+    runtime: Any,
+    split_spec: Any,
+    plan: Any,
+    *,
+    node_index: int | None = None,
+    graph_signature: str = "",
+    parameter_index: ParameterCountIndex | None = None,
+) -> SplitCandidate:
+    graph = runtime.trace_graph
+    prefix_nodes = list(plan.prefix_node_ids)
+    suffix_nodes = list(plan.suffix_node_ids)
+    boundary_labels = list(plan.boundary_node_ids)
+    specs = plan.boundary_spec
+    payload_bytes = payload_bytes_from_plan(runtime, plan)
+    index = parameter_index or ParameterCountIndex.from_runtime(runtime)
+    edge_params = index.count(prefix_nodes)
+    suffix_params = index.count(suffix_nodes)
+    trainable_suffix_params = index.count(suffix_nodes, trainable_only=True)
+    trainable_prefix_params = index.count(prefix_nodes, trainable_only=True)
+    total_params = index.total_count
+    freezing_ratio = float(edge_params) / float(total_params) if total_params else 0.0
+    privacy_leakage = 1.0 / float(edge_params) if edge_params > 0 else float("inf")
+    nodes = {node.canonical_id: node for node in graph.nodes}
+    target_node = nodes[plan.target_node_id]
+    suffix_compute_nodes = [node_id for node_id in suffix_nodes if not nodes[node_id].is_output]
+    split_label = target_node.label
+    boundary = f"{plan.boundary_kind}:{plan.target_node_id}"
+    candidate_id = boundary
+    descriptor = {
+        "candidate_id": candidate_id,
+        "split_label": split_label,
+        "boundary": boundary,
+        "boundary_tensor_labels": boundary_labels,
+        "boundary_schema": boundary_schema_summary(specs),
+        "feature_layout": feature_layout_from_specs(specs),
+        "prefix_node_count": len(prefix_nodes),
+        "suffix_node_count": len(suffix_compute_nodes),
+        "trainable_prefix_parameter_count": trainable_prefix_params,
+        "trainable_suffix_parameter_count": trainable_suffix_params,
+        "torchlens_split_id": plan.split_id,
+        "torchlens_split_label": split_label,
+        "runtime_backend": "torchlens_native",
+        "payload_batch_size": runtime.traced_batch_size,
+    }
+    return SplitCandidate(
+        candidate_id=candidate_id,
+        split_label=split_label,
+        boundary=boundary,
+        boundary_tensor_labels=boundary_labels,
+        boundary_count=len(boundary_labels),
+        estimated_payload_bytes=payload_bytes,
+        layer_index=node_index,
+        node_index=node_index,
+        edge_parameter_count=edge_params,
+        suffix_parameter_count=suffix_params,
+        total_parameter_count=total_params,
+        layer_freezing_ratio=freezing_ratio,
+        privacy_leakage=privacy_leakage,
+        is_trainable_tail=split_spec.features.training
+        and trainable_suffix_params > 0,
+        graph_signature=graph_signature,
+        descriptor=descriptor,
+    )
+
+
+def build_candidate_descriptor(candidate: SplitCandidate) -> dict[str, Any]:
+    return candidate.to_dict()

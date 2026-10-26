@@ -1,0 +1,230 @@
+"""Flower bidi transport and server-model RPCs sharing one gRPC channel."""
+
+import time
+import uuid
+from queue import Queue
+from pathlib import Path
+from logging import DEBUG
+from contextlib import contextmanager
+from typing import Optional, Callable, Tuple, Union, Type, ContextManager, Iterator, cast
+
+import grpc
+from grpc import RpcError
+from flwr.common import (
+    DEFAULT_TTL,
+    GRPC_MAX_MESSAGE_LENGTH,
+    ConfigsRecord,
+    Message,
+    Metadata,
+    RecordSet,
+    serde,
+    log,
+)
+try:
+    from flwr.compat.common import recorddict_compat as compat
+except ImportError:  # Flower 1.29 on the physical Orin workers.
+    from flwr.common import recorddict_compat as compat
+from flwr.proto.transport_pb2 import (  # pylint: disable=E0611
+    ClientMessage,
+    Reason,
+    ServerMessage,
+)
+from flwr.proto.transport_pb2_grpc import FlowerServiceStub  # pylint: disable=E0611
+from flwr.app.message_type import MessageType
+from flwr.common.constant import MessageTypeLegacy
+
+from splitfleet.proto.server_model_pb2_grpc import ServerModelStub
+from splitfleet.common.address import parse_address
+
+
+# SplitFleet keeps this transport because the same channel also carries its
+# server-model RPC service.
+TRANSPORT_TYPE_GRPC_BIDI = "grpc-bidi"
+
+
+Connection = Tuple[Callable[[], Message], Callable[[Message], None], ServerModelStub]
+
+
+def init_connection(transport: str, server_address: str) -> Tuple[
+    Callable[..., ContextManager[Connection]], str, Type[Exception]
+]:
+    # Parse IP address
+    parsed_address = parse_address(server_address)
+    if not parsed_address:
+        raise ValueError(f"Server address ({server_address}) cannot be parsed.")
+    host, port, is_v6 = parsed_address
+    address = f"[{host}]:{port}" if is_v6 else f"{host}:{port}"
+
+    if transport != TRANSPORT_TYPE_GRPC_BIDI:
+        raise ValueError(
+            f"Unsupported transport {transport!r}; use {TRANSPORT_TYPE_GRPC_BIDI!r}."
+        )
+
+    return grpc_connection, address, RpcError
+
+
+@contextmanager
+def grpc_connection(  # pylint: disable=R0913, R0915
+    server_address: str,
+    insecure: bool,
+    max_message_length: int = GRPC_MAX_MESSAGE_LENGTH,
+    root_certificates: Optional[Union[bytes, str]] = None,
+) -> Iterator[Connection]:
+    """Establish a gRPC connection to a gRPC server.
+
+    Parameters
+    ----------
+    server_address : str
+        The IPv4 or IPv6 address of the server. If the Flower server runs on the same
+        machine on port 8080, then `server_address` would be `"0.0.0.0:8080"` or
+        `"[::]:8080"`.
+    insecure : bool
+        Starts an insecure gRPC connection when True. Enables HTTPS connection
+        when False, using system certificates if `root_certificates` is None.
+    max_message_length : int
+        The maximum length of gRPC messages that can be exchanged with the Flower
+        server. The default should be sufficient for most models. Users who train
+        very large models might need to increase this value. Note that the Flower
+        server needs to be started with the same value
+        (see `flwr.server.start_server`), otherwise it will not know about the
+        increased limit and block larger messages.
+        (default: 536_870_912, this equals 512MB)
+    root_certificates : Optional[bytes] (default: None)
+        The PEM-encoded root certificates as a byte string or a path string.
+        If provided, a secure connection using the certificates will be
+        established to an SSL-enabled Flower server.
+
+    Returns
+    -------
+    receive, send, server_model_stub
+        Flower instruction receiver, response sender, and server-model RPC stub.
+    """
+    if isinstance(root_certificates, str):
+        root_certificates = Path(root_certificates).read_bytes()
+
+    channel_options = [
+        ("grpc.max_send_message_length", max_message_length),
+        ("grpc.max_receive_message_length", max_message_length),
+        ("grpc.keepalive_time_ms", 30_000),
+        ("grpc.keepalive_timeout_ms", 60_000),
+        ("grpc.keepalive_permit_without_calls", 1),
+        ("grpc.http2.max_pings_without_data", 0),
+        ("grpc.enable_retries", 1),
+        ("grpc.initial_reconnect_backoff_ms", 1_000),
+        ("grpc.max_reconnect_backoff_ms", 10_000),
+    ]
+    if insecure:
+        channel = grpc.insecure_channel(server_address, options=channel_options)
+    else:
+        credentials = grpc.ssl_channel_credentials(root_certificates)
+        channel = grpc.secure_channel(
+            server_address,
+            credentials,
+            options=channel_options,
+        )
+    channel.subscribe(lambda state: log(DEBUG, "gRPC channel state: %s", state))
+
+    queue: Queue[ClientMessage] = Queue(  # pylint: disable=unsubscriptable-object
+        maxsize=1
+    )
+    stub = FlowerServiceStub(channel)
+    server_model_servicer_stub = ServerModelStub(channel)
+
+    server_message_iterator: Iterator[ServerMessage] = stub.Join(iter(queue.get, None))
+
+    def receive() -> Message:
+        # Receive ServerMessage proto
+        proto = next(server_message_iterator)
+
+        # ServerMessage proto --> *Ins --> RecordSet
+        field = proto.WhichOneof("msg")
+        message_type = ""
+        if field == "get_properties_ins":
+            recordset = compat.getpropertiesins_to_recorddict(
+                serde.get_properties_ins_from_proto(proto.get_properties_ins)
+            )
+            message_type = MessageTypeLegacy.GET_PROPERTIES
+        elif field == "get_parameters_ins":
+            recordset = compat.getparametersins_to_recorddict(
+                serde.get_parameters_ins_from_proto(proto.get_parameters_ins)
+            )
+            message_type = MessageTypeLegacy.GET_PARAMETERS
+        elif field == "fit_ins":
+            recordset = compat.fitins_to_recorddict(
+                serde.fit_ins_from_proto(proto.fit_ins), False
+            )
+            message_type = MessageType.TRAIN
+        elif field == "evaluate_ins":
+            recordset = compat.evaluateins_to_recorddict(
+                serde.evaluate_ins_from_proto(proto.evaluate_ins), False
+            )
+            message_type = MessageType.EVALUATE
+        elif field == "reconnect_ins":
+            recordset = RecordSet()
+            recordset.configs_records["config"] = ConfigsRecord(
+                {"seconds": proto.reconnect_ins.seconds}
+            )
+            message_type = "reconnect"
+        else:
+            raise ValueError(
+                "Unsupported instruction in ServerMessage, "
+                "cannot deserialize from ProtoBuf"
+            )
+
+        # Construct Message
+        return Message(
+            metadata=Metadata(
+                run_id=0,
+                message_id=str(uuid.uuid4()),
+                src_node_id=0,
+                dst_node_id=0,
+                reply_to_message_id="",
+                group_id="",
+                created_at=time.time(),
+                ttl=DEFAULT_TTL,
+                message_type=message_type,
+            ),
+            content=recordset,
+        )
+
+    def send(message: Message) -> None:
+        # Retrieve RecordSet and message_type
+        recordset = message.content
+        message_type = message.metadata.message_type
+
+        # RecordSet --> *Res --> *Res proto -> ClientMessage proto
+        if message_type == MessageTypeLegacy.GET_PROPERTIES:
+            getpropres = compat.recorddict_to_getpropertiesres(recordset)
+            msg_proto = ClientMessage(
+                get_properties_res=serde.get_properties_res_to_proto(getpropres)
+            )
+        elif message_type == MessageTypeLegacy.GET_PARAMETERS:
+            getparamres = compat.recorddict_to_getparametersres(recordset, False)
+            msg_proto = ClientMessage(
+                get_parameters_res=serde.get_parameters_res_to_proto(getparamres)
+            )
+        elif message_type == MessageType.TRAIN:
+            fitres = compat.recorddict_to_fitres(recordset, False)
+            msg_proto = ClientMessage(fit_res=serde.fit_res_to_proto(fitres))
+        elif message_type == MessageType.EVALUATE:
+            evalres = compat.recorddict_to_evaluateres(recordset)
+            msg_proto = ClientMessage(evaluate_res=serde.evaluate_res_to_proto(evalres))
+        elif message_type == "reconnect":
+            reason = cast(
+                Reason.ValueType, recordset.configs_records["config"]["reason"]
+            )
+            msg_proto = ClientMessage(
+                disconnect_res=ClientMessage.DisconnectRes(reason=reason)
+            )
+        else:
+            raise ValueError(f"Invalid message type: {message_type}")
+
+        # Send ClientMessage proto
+        return queue.put(msg_proto, block=False)
+
+    try:
+        yield receive, send, server_model_servicer_stub
+    finally:
+        # Make sure to have a final
+        channel.close()
+        log(DEBUG, "gRPC channel closed")
